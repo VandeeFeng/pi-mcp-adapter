@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-const fs = require("fs");
-const path = require("path");
-const https = require("https");
-const os = require("os");
-const { execSync } = require("child_process");
+import fs from "node:fs";
+import path from "node:path";
+import https from "node:https";
+import os from "node:os";
+import { execSync } from "node:child_process";
 
 const REPO_URL = "https://raw.githubusercontent.com/nicobailon/pi-mcp-adapter/master";
 const EXT_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-mcp-adapter");
@@ -60,7 +60,7 @@ async function main() {
   console.log("\nInstalling dependencies...");
   try {
     execSync("npm install --production", { cwd: EXT_DIR, stdio: "inherit" });
-  } catch (err) {
+  } catch {
     console.error("Warning: npm install failed. You may need to run it manually.");
   }
 
