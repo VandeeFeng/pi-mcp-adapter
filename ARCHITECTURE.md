@@ -329,28 +329,30 @@
 ┌───────────────────────────────────────────────────────────────┐
 │              mcp tool execute() - executeCall()               │
 │                                                               │
-│  1. Look up tool in toolMetadata                              │
+│  1. Look up tool in toolMetadata (may be from cache)          │
 │     for (const [server, metadata] of toolMetadata) {          │
 │       const found = metadata.find(m => m.name === toolName);  │
 │       if (found) { serverName = server; toolMeta = found; }   │
 │     }                                                         │
+│     If not found: try prefix-match → lazy connect candidate   │
 │                                                               │
-│  2. Get connection from ServerManager                         │
+│  2. Ensure connection (lazy connect if needed)                │
 │     const connection = manager.getConnection(serverName);     │
-│     if (!connection || connection.status !== "connected")     │
-│       return error;                                           │
+│     if (!connection || status !== "connected")                │
+│       → check failure backoff (60s)                           │
+│       → connect, refresh metadata, re-resolve toolMeta        │
 │                                                               │
-│  3. Call MCP server                                           │
+│  3. Call MCP server (with in-flight tracking)                 │
+│     incrementInFlight() + touch()                             │
 │     if (toolMeta.resourceUri) {                               │
-│       // Resource tool - use readResource                     │
 │       connection.client.readResource({ uri: resourceUri });   │
 │     } else {                                                  │
-│       // Regular tool - use callTool                          │
 │       connection.client.callTool({                            │
 │         name: toolMeta.originalName,  ◄── Original name!      │
 │         arguments: args ?? {}                                 │
 │       });                                                     │
 │     }                                                         │
+│     finally { decrementInFlight() + touch() }                 │
 └───────────────────────────┬───────────────────────────────────┘
                             │
                             ▼
@@ -411,6 +413,12 @@
 
 ## Lifecycle & Health Checks
 
+Servers support three lifecycle modes:
+
+- **lazy** (default): Don't connect at startup. Connect on first tool call. Subject to idle timeout (default 10 minutes). Cached metadata enables search/list without connections.
+- **eager**: Connect at startup. No idle timeout by default. If the connection drops, reconnects on next use (like lazy).
+- **keep-alive**: Connect at startup. No idle timeout. Auto-reconnects via health checks if the connection drops.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          Session Start                                      │
@@ -423,11 +431,17 @@
                     │  1. Load config                 │
                     │  2. Create ServerManager        │
                     │  3. Create LifecycleManager     │
-                    │  4. Connect to each server      │
-                    │  5. Collect tool metadata       │
-                    │  6. Mark keep-alive servers     │
-                    │  7. Start health checks         │
-                    │  8. Set reconnect callback      │
+                    │  4. Load metadata cache         │
+                    │  5. Register all servers with   │
+                    │     lifecycle manager            │
+                    │  6. Reconstruct toolMetadata    │
+                    │     from cache (no connection)  │
+                    │  7. Connect only eager +        │
+                    │     keep-alive servers           │
+                    │     (or all on first-run         │
+                    │      bootstrap)                  │
+                    │  8. Start health checks         │
+                    │  9. Set reconnect/idle callbacks │
                     └─────────────────┬───────────────┘
                                       │
                                       ▼
@@ -439,25 +453,39 @@
 │   │                                                                     │   │
 │   │     for each keep-alive server:                                     │   │
 │   │       if (status !== "connected"):                                  │   │
-│   │         try reconnect                                               │   │
-│   │         if success: call onReconnect callback                       │   │
-│   │                     → updates toolMetadata                          │   │
+│   │         try reconnect → onReconnect → updates toolMetadata + cache  │   │
 │   │                                                                     │   │
-│   │     ┌──────────────────────────────────────────────────────────┐    │   │
-│   │     │  Note: Reconnect callback updates tool metadata so       │    │   │
-│   │     │  the mcp proxy tool can find tools after reconnection.   │    │   │
-│   │     └──────────────────────────────────────────────────────────┘    │   │
+│   │     for each non-keep-alive server:                                 │   │
+│   │       if idle > timeout and inFlight == 0:                          │   │
+│   │         close connection → onIdleShutdown                           │   │
+│   │         (toolMetadata preserved for search/list)                    │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    Lazy Connection (on tool call)                    │   │
+│   │                                                                     │   │
+│   │     executeCall() finds tool in cached metadata but no connection:  │   │
+│   │       1. Check failure backoff (60s)                                │   │
+│   │       2. Connect server                                             │   │
+│   │       3. Refresh metadata from live connection                      │   │
+│   │       4. Re-resolve tool (may have changed since cache)             │   │
+│   │       5. Execute tool call with in-flight tracking                  │   │
+│   │                                                                     │   │
+│   │     Prefix-match fallback: if tool name has a server prefix but     │   │
+│   │       no metadata, try connecting the matching server               │   │
 │   │                                                                     │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
 │   │                    /mcp Commands                                    │   │
 │   │                                                                     │   │
-│   │   /mcp status    - Show all servers and their connection status    │   │
-│   │   /mcp tools     - List all available MCP tools                    │   │
-│   │   /mcp reconnect - Force reconnect all servers, update metadata    │   │
+│   │   /mcp status           - Show all servers and connection status   │   │
+│   │   /mcp tools            - List all available MCP tools             │   │
+│   │   /mcp reconnect        - Force reconnect all servers              │   │
+│   │   /mcp reconnect <name> - Connect or reconnect a single server    │   │
 │   │                                                                     │   │
-│   │   /mcp-auth <server> - Show OAuth setup instructions               │   │
+│   │   /mcp-auth <server>    - Show OAuth setup instructions            │   │
 │   │                                                                     │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -468,9 +496,9 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          Graceful Shutdown                                  │
 │                                                                             │
-│   1. Clear health check interval                                            │
-│   2. Close all MCP connections (client + transport)                         │
-│   3. Tool calls via mcp proxy return "not connected" error                  │
+│   1. Flush metadata cache for all connected servers                         │
+│   2. Clear health check interval                                            │
+│   3. Close all MCP connections (client + transport)                         │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -498,17 +526,26 @@
 │                         - HTTP transport (StreamableHTTP + SSE fallback)
 │                         - connection pooling and deduplication
 │
-├── tool-registrar.ts     Tool name collection (NOT registration!)
-│                         - collectToolNames() - builds name list
+├── tool-registrar.ts     MCP content transformation
 │                         - transformMcpContent() - MCP → Pi content
 │
-├── resource-tools.ts     Resource tool name collection
-│                         - collectResourceToolNames()
+├── resource-tools.ts     Resource name utilities
 │                         - resourceNameToToolName()
 │
-├── lifecycle.ts          Health checks, reconnection
-│                         - keep-alive server tracking
-│                         - reconnect callback for metadata updates
+├── metadata-cache.ts     Persistent tool/resource metadata cache
+│                         - Per-server cache at ~/.pi/agent/mcp-cache.json
+│                         - Config hashing, staleness checks, reconstruction
+│                         - Read-merge-write for multi-session safety
+│
+├── npx-resolver.ts       npx binary resolution (skip npm parent process)
+│                         - Probes ~/.npm/_npx/ cache directly
+│                         - Persistent cache at ~/.pi/agent/mcp-npx-cache.json
+│                         - JS detection (extension + shebang)
+│
+├── lifecycle.ts          Health checks, reconnection, idle timeout
+│                         - keep-alive server tracking + auto-reconnect
+│                         - Idle timeout for lazy/eager servers
+│                         - Per-server and global timeout settings
 │
 ├── oauth-handler.ts      OAuth token file reading
 │                         - getStoredTokens() from ~/.pi/agent/mcp-oauth/
@@ -567,6 +604,27 @@
 │     ──────────────────                                                      │
 │     Lifecycle manager notifies extension after auto-reconnect.              │
 │     Extension updates tool metadata so proxy can find tools.                │
+│                                                                             │
+│  8. LAZY BY DEFAULT                                                         │
+│     ───────────────                                                         │
+│     All servers default to lifecycle: "lazy". They only connect             │
+│     when a tool call needs them. Cached metadata enables                    │
+│     search/list/describe without live connections. Idle servers             │
+│     are disconnected after 10 minutes (configurable).                       │
+│                                                                             │
+│  9. METADATA CACHE                                                          │
+│     ──────────────                                                          │
+│     ~/.pi/agent/mcp-cache.json stores per-server tool/resource              │
+│     metadata with config hash validation and 7-day staleness.               │
+│     Cache stores original MCP names (not prefixed) — toolPrefix             │
+│     changes never invalidate the cache. Read-merge-write with               │
+│     per-process tmp files for multi-session safety.                         │
+│                                                                             │
+│  10. NPX RESOLUTION                                                         │
+│      ───────────────                                                        │
+│      npx-based servers resolve to direct binary paths, eliminating          │
+│      the ~143 MB npm parent process per server. Probes ~/.npm/_npx/         │
+│      cache directly. JS files run via node, others executed directly.       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```

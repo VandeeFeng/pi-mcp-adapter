@@ -19,6 +19,8 @@ const FILES = [
   "tool-registrar.ts",
   "resource-tools.ts",
   "lifecycle.ts",
+  "metadata-cache.ts",
+  "npx-resolver.ts",
   "oauth-handler.ts",
   "package.json",
   "tsconfig.json",

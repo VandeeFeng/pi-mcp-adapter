@@ -109,6 +109,7 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
   switch (kind) {
     case "claude-desktop":
     case "claude-code":
+    case "codex":
       servers = obj.mcpServers;
       break;
     case "cursor":
@@ -116,14 +117,10 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
     case "vscode":
       servers = obj.mcpServers ?? obj["mcp-servers"];
       break;
-    case "codex":
-      servers = obj.mcpServers;
-      break;
     default:
       return {};
   }
   
-  // Validate servers is a plain object
   if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
     return {};
   }

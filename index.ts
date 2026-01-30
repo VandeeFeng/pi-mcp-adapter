@@ -1,27 +1,48 @@
 // index.ts - Full extension entry point with commands
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { existsSync } from "node:fs";
 import { loadMcpConfig } from "./config.js";
-import { formatToolName, type McpConfig, type McpContent } from "./types.js";
+import { formatToolName, getServerPrefix, type McpConfig, type McpContent, type ToolMetadata, type McpTool, type McpResource, type ServerEntry } from "./types.js";
 import { McpServerManager } from "./server-manager.js";
 import { McpLifecycleManager } from "./lifecycle.js";
-import { collectToolNames, transformMcpContent } from "./tool-registrar.js";
-import { collectResourceToolNames, resourceNameToToolName } from "./resource-tools.js";
-
-interface ToolMetadata {
-  name: string;           // Prefixed tool name (e.g., "xcodebuild_list_sims")
-  originalName: string;   // Original MCP tool name (e.g., "list_sims")
-  description: string;
-  resourceUri?: string;   // For resource tools: the URI to read
-  inputSchema?: unknown;  // JSON Schema for parameters (stored for describe/errors)
-}
+import { transformMcpContent } from "./tool-registrar.js";
+import { resourceNameToToolName } from "./resource-tools.js";
+import {
+  computeServerHash,
+  getMetadataCachePath,
+  isServerCacheValid,
+  loadMetadataCache,
+  reconstructToolMetadata,
+  saveMetadataCache,
+  serializeResources,
+  serializeTools,
+  type ServerCacheEntry,
+} from "./metadata-cache.js";
 
 interface McpExtensionState {
   manager: McpServerManager;
   lifecycle: McpLifecycleManager;
-  registeredTools: Map<string, string[]>;
   toolMetadata: Map<string, ToolMetadata[]>;  // server -> tool metadata for searching
   config: McpConfig;
+  failureTracker: Map<string, number>;
+  ui?: ExtensionContext["ui"];
+}
+
+const FAILURE_BACKOFF_MS = 60 * 1000;
+
+/**
+ * Find a tool by name with hyphen/underscore normalization fallback.
+ * MCP tools often use hyphens (resolve-library-id) but the prefix separator
+ * is underscore, so LLMs naturally guess all-underscores. Try exact match
+ * first, then normalized match.
+ */
+function findToolByName(metadata: ToolMetadata[] | undefined, toolName: string): ToolMetadata | undefined {
+  if (!metadata) return undefined;
+  const exact = metadata.find(m => m.name === toolName);
+  if (exact) return exact;
+  const normalized = toolName.replace(/-/g, "_");
+  return metadata.find(m => m.name.replace(/-/g, "_") === normalized);
 }
 
 /** Run async tasks with concurrency limit */
@@ -64,24 +85,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     initPromise.then(s => {
       state = s;
       initPromise = null;
-      
-      // Set up callback for auto-reconnect to update metadata
-      s.lifecycle.setReconnectCallback((serverName) => {
-        if (state) {
-          updateServerMetadata(state, serverName);
-        }
-      });
-      
-      // Update status bar when ready
-      if (ctx.hasUI) {
-        const serverCount = s.registeredTools.size;
-        if (serverCount > 0) {
-          const label = serverCount === 1 ? "server" : "servers";
-          ctx.ui.setStatus("mcp", ctx.ui.theme.fg("accent", `MCP: ${serverCount} ${label}`));
-        } else {
-          ctx.ui.setStatus("mcp", "");
-        }
-      }
+      updateStatusBar(s);
     }).catch(err => {
       console.error("MCP initialization failed:", err);
       initPromise = null;
@@ -98,6 +102,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     }
     
     if (state) {
+      flushMetadataCache(state);
       await state.lifecycle.gracefulShutdown();
       state = null;
     }
@@ -121,11 +126,13 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         return;
       }
       
-      const subcommand = args?.trim()?.split(/\s+/)?.[0] ?? "";
+      const parts = args?.trim()?.split(/\s+/) ?? [];
+      const subcommand = parts[0] ?? "";
+      const targetServer = parts[1];
       
       switch (subcommand) {
         case "reconnect":
-          await reconnectServers(state, ctx);
+          await reconnectServers(state, ctx, targetServer);
           break;
         case "tools":
           await showTools(state, ctx);
@@ -178,13 +185,15 @@ Usage:
   mcp({ server: "name" })               → List tools from server
   mcp({ search: "query" })              → Search for tools (MCP + pi, space-separated words OR'd)
   mcp({ describe: "tool_name" })        → Show tool details and parameters
+  mcp({ connect: "server-name" })       → Connect to a server and refresh metadata
   mcp({ tool: "name", args: '{"key": "value"}' })    → Call a tool (args is JSON string)
 
-Mode: tool (call) > describe > search > server (list) > nothing (status)`,
+Mode: tool (call) > connect > describe > search > server (list) > nothing (status)`,
     parameters: Type.Object({
       // Call mode
       tool: Type.Optional(Type.String({ description: "Tool name to call (e.g., 'xcodebuild_list_sims')" })),
       args: Type.Optional(Type.String({ description: "Arguments as JSON string (e.g., '{\"key\": \"value\"}')" })),
+      connect: Type.Optional(Type.String({ description: "Server name to connect (lazy connect + metadata refresh)" })),
       // Describe mode
       describe: Type.Optional(Type.String({ description: "Tool name to describe (shows parameters)" })),
       // Search mode
@@ -192,11 +201,12 @@ Mode: tool (call) > describe > search > server (list) > nothing (status)`,
       regex: Type.Optional(Type.Boolean({ description: "Treat search as regex (default: substring match)" })),
       includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: true)" })),
       // Filter (works with search or list)
-      server: Type.Optional(Type.String({ description: "Filter to specific server" })),
+      server: Type.Optional(Type.String({ description: "Filter to specific server (also disambiguates tool calls)" })),
     }),
     async execute(_toolCallId, params: {
       tool?: string;
       args?: string;
+      connect?: string;
       describe?: string;
       search?: string;
       regex?: boolean;
@@ -243,9 +253,12 @@ Mode: tool (call) > describe > search > server (list) > nothing (status)`,
         };
       }
       
-      // Mode resolution: tool > describe > search > server > status
+      // Mode resolution: tool > connect > describe > search > server > status
       if (params.tool) {
-        return executeCall(state, params.tool, parsedArgs);
+        return executeCall(state, params.tool, parsedArgs, params.server);
+      }
+      if (params.connect) {
+        return executeConnect(state, params.connect);
       }
       if (params.describe) {
         return executeDescribe(state, params.describe);
@@ -265,30 +278,48 @@ Mode: tool (call) > describe > search > server (list) > nothing (status)`,
 
 function executeStatus(state: McpExtensionState) {
   const servers: Array<{ name: string; status: string; toolCount: number }> = [];
-  
+
   for (const name of Object.keys(state.config.mcpServers)) {
     const connection = state.manager.getConnection(name);
-    const toolNames = state.registeredTools.get(name) ?? [];
-    servers.push({
-      name,
-      status: connection?.status ?? "not connected",
-      toolCount: toolNames.length,
-    });
+    const toolCount = getToolNames(state, name).length;
+    const failedAgo = getFailureAgeSeconds(state, name);
+    let status = "not connected";
+    if (connection?.status === "connected") {
+      status = "connected";
+    } else if (failedAgo !== null) {
+      status = "failed";
+    } else if (state.toolMetadata.has(name)) {
+      status = "cached";
+    }
+
+    servers.push({ name, status, toolCount });
   }
-  
+
   const totalTools = servers.reduce((sum, s) => sum + s.toolCount, 0);
   const connectedCount = servers.filter(s => s.status === "connected").length;
-  
+
   let text = `MCP: ${connectedCount}/${servers.length} servers, ${totalTools} tools\n\n`;
   for (const server of servers) {
-    const icon = server.status === "connected" ? "✓" : "○";
-    text += `${icon} ${server.name} (${server.toolCount} tools)\n`;
+    if (server.status === "connected") {
+      text += `✓ ${server.name} (${server.toolCount} tools)\n`;
+      continue;
+    }
+    if (server.status === "cached") {
+      text += `○ ${server.name} (${server.toolCount} tools, cached)\n`;
+      continue;
+    }
+    if (server.status === "failed") {
+      const failedAgo = getFailureAgeSeconds(state, server.name) ?? 0;
+      text += `✗ ${server.name} (failed ${failedAgo}s ago)\n`;
+      continue;
+    }
+    text += `○ ${server.name} (not connected)\n`;
   }
-  
+
   if (servers.length > 0) {
     text += `\nmcp({ server: "name" }) to list tools, mcp({ search: "..." }) to search`;
   }
-  
+
   return {
     content: [{ type: "text" as const, text: text.trim() }],
     details: { mode: "status", servers, totalTools, connectedCount },
@@ -301,7 +332,7 @@ function executeDescribe(state: McpExtensionState, toolName: string) {
   let toolMeta: ToolMetadata | undefined;
   
   for (const [server, metadata] of state.toolMetadata.entries()) {
-    const found = metadata.find(m => m.name === toolName);
+    const found = findToolByName(metadata, toolName);
     if (found) {
       serverName = server;
       toolMeta = found;
@@ -559,33 +590,40 @@ function executeSearch(
 }
 
 function executeList(state: McpExtensionState, server: string) {
-  const toolNames = state.registeredTools.get(server);
-  const metadata = state.toolMetadata.get(server);
-  
-  if (!toolNames || toolNames.length === 0) {
-    // Server exists in registeredTools (even if empty) means it connected
-    if (state.registeredTools.has(server)) {
-      return {
-        content: [{ type: "text" as const, text: `Server "${server}" has no tools.` }],
-        details: { mode: "list", server, tools: [], count: 0 },
-      };
-    }
-    // Server in config but not in registeredTools means connection failed
-    if (state.config.mcpServers[server]) {
-      return {
-        content: [{ type: "text" as const, text: `Server "${server}" is configured but not connected. Use /mcp reconnect to retry.` }],
-        details: { mode: "list", server, tools: [], count: 0, error: "not_connected" },
-      };
-    }
-    // Server not in config at all
+  if (!state.config.mcpServers[server]) {
     return {
       content: [{ type: "text" as const, text: `Server "${server}" not found. Use mcp({}) to see available servers.` }],
       details: { mode: "list", server, tools: [], count: 0, error: "not_found" },
     };
   }
-  
-  let text = `${server} (${toolNames.length} tools):\n\n`;
-  
+
+  const metadata = state.toolMetadata.get(server);
+  const toolNames = getToolNames(state, server);
+  const hasMetadata = state.toolMetadata.has(server);
+  const connection = state.manager.getConnection(server);
+
+  if (toolNames.length === 0) {
+    if (connection?.status === "connected") {
+      return {
+        content: [{ type: "text" as const, text: `Server "${server}" has no tools.` }],
+        details: { mode: "list", server, tools: [], count: 0 },
+      };
+    }
+    if (hasMetadata) {
+      return {
+        content: [{ type: "text" as const, text: `Server "${server}" has no cached tools (not connected).` }],
+        details: { mode: "list", server, tools: [], count: 0, cached: true },
+      };
+    }
+    return {
+      content: [{ type: "text" as const, text: `Server "${server}" is configured but not connected. Use mcp({ connect: "${server}" }) or /mcp reconnect ${server} to retry.` }],
+      details: { mode: "list", server, tools: [], count: 0, error: "not_connected" },
+    };
+  }
+
+  const cachedNote = connection?.status === "connected" ? "" : " (not connected, cached)";
+  let text = `${server} (${toolNames.length} tools${cachedNote}):\n\n`;
+
   // Build a map of tool name -> description for quick lookup
   const descMap = new Map<string, string>();
   if (metadata) {
@@ -593,7 +631,7 @@ function executeList(state: McpExtensionState, server: string) {
       descMap.set(m.name, m.description);
     }
   }
-  
+
   for (const tool of toolNames) {
     const desc = descMap.get(tool) ?? "";
     const truncated = truncateAtWord(desc, 50);
@@ -601,47 +639,181 @@ function executeList(state: McpExtensionState, server: string) {
     if (truncated) text += ` - ${truncated}`;
     text += "\n";
   }
-  
+
   return {
     content: [{ type: "text" as const, text: text.trim() }],
     details: { mode: "list", server, tools: toolNames, count: toolNames.length },
   };
 }
 
+async function executeConnect(state: McpExtensionState, serverName: string) {
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) {
+    return {
+      content: [{ type: "text" as const, text: `Server "${serverName}" not found. Use mcp({}) to see available servers.` }],
+      details: { mode: "connect", error: "not_found", server: serverName },
+    };
+  }
+
+  try {
+    if (state.ui) {
+      state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
+    }
+    const connection = await state.manager.connect(serverName, definition);
+    const prefix = state.config.settings?.toolPrefix ?? "server";
+    const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
+    state.toolMetadata.set(serverName, metadata);
+    updateMetadataCache(state, serverName);
+    state.failureTracker.delete(serverName);
+    updateStatusBar(state);
+    return executeList(state, serverName);
+  } catch (error) {
+    state.failureTracker.set(serverName, Date.now());
+    updateStatusBar(state);
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Failed to connect to "${serverName}": ${message}` }],
+      details: { mode: "connect", error: "connect_failed", server: serverName, message },
+    };
+  }
+}
+
 async function executeCall(
   state: McpExtensionState,
   toolName: string,
-  args?: Record<string, unknown>
+  args?: Record<string, unknown>,
+  serverOverride?: string
 ) {
   // Find the tool in metadata
-  let serverName: string | undefined;
+  let serverName: string | undefined = serverOverride;
   let toolMeta: ToolMetadata | undefined;
-  
-  for (const [server, metadata] of state.toolMetadata.entries()) {
-    const found = metadata.find(m => m.name === toolName);
-    if (found) {
-      serverName = server;
-      toolMeta = found;
-      break;
+  const prefixMode = state.config.settings?.toolPrefix ?? "server";
+
+  if (serverName && !state.config.mcpServers[serverName]) {
+    return {
+      content: [{ type: "text" as const, text: `Server "${serverName}" not found. Use mcp({}) to see available servers.` }],
+      details: { mode: "call", error: "server_not_found", server: serverName },
+    };
+  }
+
+  if (serverName) {
+    toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+  } else {
+    for (const [server, metadata] of state.toolMetadata.entries()) {
+      const found = findToolByName(metadata, toolName);
+      if (found) {
+        serverName = server;
+        toolMeta = found;
+        break;
+      }
     }
   }
-  
+
+  if (serverName && !toolMeta) {
+    const connected = await lazyConnect(state, serverName);
+    if (connected) {
+      toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+    } else {
+      const failedAgo = getFailureAgeSeconds(state, serverName);
+      if (failedAgo !== null) {
+        return {
+          content: [{ type: "text" as const, text: `Server "${serverName}" not available (last failed ${failedAgo}s ago)` }],
+          details: { mode: "call", error: "server_backoff", server: serverName },
+        };
+      }
+    }
+  }
+
+  let prefixMatchedServer: string | undefined;
+
+  if (!serverName && !toolMeta && prefixMode !== "none") {
+    const candidates = Object.keys(state.config.mcpServers)
+      .map(name => ({ name, prefix: getServerPrefix(name, prefixMode) }))
+      .filter(c => c.prefix && toolName.startsWith(c.prefix + "_"))
+      .sort((a, b) => b.prefix.length - a.prefix.length);
+
+    for (const { name: configuredServer } of candidates) {
+      const failedAgo = getFailureAgeSeconds(state, configuredServer);
+      if (failedAgo !== null) continue;
+      const connected = await lazyConnect(state, configuredServer);
+      if (!connected) continue;
+      if (!prefixMatchedServer) prefixMatchedServer = configuredServer;
+      toolMeta = findToolByName(state.toolMetadata.get(configuredServer), toolName);
+      if (toolMeta) {
+        serverName = configuredServer;
+        break;
+      }
+    }
+  }
+
   if (!serverName || !toolMeta) {
+    const hintServer = serverName ?? prefixMatchedServer;
+    const available = hintServer ? getToolNames(state, hintServer) : [];
+    let msg = `Tool "${toolName}" not found.`;
+    if (available.length > 0) {
+      msg += ` Server "${hintServer}" has: ${available.join(", ")}`;
+    } else {
+      msg += ` Use mcp({ search: "..." }) to search.`;
+    }
     return {
-      content: [{ type: "text" as const, text: `Tool "${toolName}" not found. Use mcp({ search: "..." }) to search.` }],
-      details: { mode: "call", error: "tool_not_found", requestedTool: toolName },
+      content: [{ type: "text" as const, text: msg }],
+      details: { mode: "call", error: "tool_not_found", requestedTool: toolName, hintServer },
     };
   }
-  
-  const connection = state.manager.getConnection(serverName);
+
+  let connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") {
-    return {
-      content: [{ type: "text" as const, text: `Server "${serverName}" not connected` }],
-      details: { mode: "call", error: "server_not_connected", server: serverName },
-    };
+    const failedAgo = getFailureAgeSeconds(state, serverName);
+    if (failedAgo !== null) {
+      return {
+        content: [{ type: "text" as const, text: `Server "${serverName}" not available (last failed ${failedAgo}s ago)` }],
+        details: { mode: "call", error: "server_backoff", server: serverName },
+      };
+    }
+
+    const definition = state.config.mcpServers[serverName];
+    if (!definition) {
+      return {
+        content: [{ type: "text" as const, text: `Server "${serverName}" not connected` }],
+        details: { mode: "call", error: "server_not_connected", server: serverName },
+      };
+    }
+
+    try {
+      if (state.ui) {
+        state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
+      }
+      connection = await state.manager.connect(serverName, definition);
+      state.failureTracker.delete(serverName);
+      updateServerMetadata(state, serverName);
+      updateMetadataCache(state, serverName);
+      updateStatusBar(state);
+      toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+      if (!toolMeta) {
+        const available = getToolNames(state, serverName);
+        const hint = available.length > 0
+          ? `Available tools on "${serverName}": ${available.join(", ")}`
+          : `Server "${serverName}" has no tools.`;
+        return {
+          content: [{ type: "text" as const, text: `Tool "${toolName}" not found on "${serverName}" after reconnect. ${hint}` }],
+          details: { mode: "call", error: "tool_not_found_after_reconnect", requestedTool: toolName },
+        };
+      }
+    } catch (error) {
+      state.failureTracker.set(serverName, Date.now());
+      updateStatusBar(state);
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Failed to connect to "${serverName}": ${message}` }],
+        details: { mode: "call", error: "connect_failed", message },
+      };
+    }
   }
-  
+
   try {
+    state.manager.touch(serverName);
+    state.manager.incrementInFlight(serverName);
+
     // Resource tools use readResource, regular tools use callTool
     if (toolMeta.resourceUri) {
       const result = await connection.client.readResource({ uri: toolMeta.resourceUri });
@@ -654,51 +826,54 @@ async function executeCall(
         details: { mode: "call", resourceUri: toolMeta.resourceUri, server: serverName },
       };
     }
-    
+
     // Regular tool call
     const result = await connection.client.callTool({
       name: toolMeta.originalName,
       arguments: args ?? {},
     });
-    
+
     const mcpContent = (result.content ?? []) as McpContent[];
     const content = transformMcpContent(mcpContent);
-    
+
     if (result.isError) {
       const errorText = content
         .filter((c) => c.type === "text")
         .map((c) => (c as { text: string }).text)
         .join("\n") || "Tool execution failed";
-      
+
       // Include schema in error to help LLM self-correct
       let errorWithSchema = `Error: ${errorText}`;
       if (toolMeta.inputSchema) {
         errorWithSchema += `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
       }
-      
+
       return {
         content: [{ type: "text" as const, text: errorWithSchema }],
         details: { mode: "call", error: "tool_error", mcpResult: result },
       };
     }
-    
+
     return {
       content: content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }],
       details: { mode: "call", mcpResult: result, server: serverName, tool: toolMeta.originalName },
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    
+
     // Include schema in error to help LLM self-correct
     let errorWithSchema = `Failed to call tool: ${message}`;
     if (toolMeta.inputSchema) {
       errorWithSchema += `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
     }
-    
+
     return {
       content: [{ type: "text" as const, text: errorWithSchema }],
       details: { mode: "call", error: "call_failed", message },
     };
+  } finally {
+    state.manager.decrementInFlight(serverName);
+    state.manager.touch(serverName);
   }
 }
 
@@ -711,20 +886,66 @@ async function initializeMcp(
   
   const manager = new McpServerManager();
   const lifecycle = new McpLifecycleManager(manager);
-  const registeredTools = new Map<string, string[]>();
   const toolMetadata = new Map<string, ToolMetadata[]>();
+  const failureTracker = new Map<string, number>();
+  const ui = ctx.hasUI ? ctx.ui : undefined;
+  const state: McpExtensionState = { manager, lifecycle, toolMetadata, config, failureTracker, ui };
   
   const serverEntries = Object.entries(config.mcpServers);
   if (serverEntries.length === 0) {
-    return { manager, lifecycle, registeredTools, toolMetadata, config };
+    return state;
   }
-  
-  if (ctx.hasUI) {
-    ctx.ui.setStatus("mcp", `Connecting to ${serverEntries.length} servers...`);
+
+  const idleSetting = typeof config.settings?.idleTimeout === "number" ? config.settings.idleTimeout : 10;
+  lifecycle.setGlobalIdleTimeout(idleSetting);
+
+  const cachePath = getMetadataCachePath();
+  const cacheFileExists = existsSync(cachePath);
+  let cache = loadMetadataCache();
+  let bootstrapAll = false;
+
+  if (!cacheFileExists) {
+    bootstrapAll = true;
+    saveMetadataCache({ version: 1, servers: {} });
+  } else if (!cache) {
+    cache = { version: 1, servers: {} };
+    saveMetadataCache(cache);
   }
-  
-  // Connect to all servers in parallel (max 10 concurrent)
-  const results = await parallelLimit(serverEntries, 10, async ([name, definition]) => {
+
+  const prefix = config.settings?.toolPrefix ?? "server";
+
+  // Register servers and hydrate metadata from cache if valid
+  for (const [name, definition] of serverEntries) {
+    const lifecycleMode = definition.lifecycle ?? "lazy";
+    const idleOverride = definition.idleTimeout ?? (lifecycleMode === "eager" ? 0 : undefined);
+    lifecycle.registerServer(
+      name,
+      definition,
+      idleOverride !== undefined ? { idleTimeout: idleOverride } : undefined
+    );
+    if (lifecycleMode === "keep-alive") {
+      lifecycle.markKeepAlive(name, definition);
+    }
+
+    if (cache?.servers?.[name] && isServerCacheValid(cache.servers[name], definition)) {
+      const metadata = reconstructToolMetadata(name, cache.servers[name], prefix, definition.exposeResources);
+      toolMetadata.set(name, metadata);
+    }
+  }
+
+  const startupServers = bootstrapAll
+    ? serverEntries
+    : serverEntries.filter(([, definition]) => {
+        const mode = definition.lifecycle ?? "lazy";
+        return mode === "keep-alive" || mode === "eager";
+      });
+
+  if (ctx.hasUI && startupServers.length > 0) {
+    ctx.ui.setStatus("mcp", `MCP: connecting to ${startupServers.length} servers...`);
+  }
+
+  // Connect selected servers in parallel (max 10 concurrent)
+  const results = await parallelLimit(startupServers, 10, async ([name, definition]) => {
     try {
       const connection = await manager.connect(name, definition);
       return { name, definition, connection, error: null };
@@ -733,8 +954,7 @@ async function initializeMcp(
       return { name, definition, connection: null, error: message };
     }
   });
-  const prefix = config.settings?.toolPrefix ?? "server";
-  
+
   // Process results
   for (const { name, definition, connection, error } of results) {
     if (error || !connection) {
@@ -744,50 +964,11 @@ async function initializeMcp(
       console.error(`MCP: Failed to connect to ${name}: ${error}`);
       continue;
     }
-    
-    // Collect tool names (NOT registered with Pi - only mcp proxy is registered)
-    const { collected: toolNames, failed: failedTools } = collectToolNames(
-      connection.tools,
-      { serverName: name, prefix }
-    );
-    
-    // Collect resource tool names (if enabled)
-    if (definition.exposeResources !== false && connection.resources.length > 0) {
-      const resourceToolNames = collectResourceToolNames(
-        connection.resources,
-        { serverName: name, prefix }
-      );
-      toolNames.push(...resourceToolNames);
-    }
-    
-    registeredTools.set(name, toolNames);
-    
-    // Build tool metadata for searching (include inputSchema for describe/errors)
-    const metadata: ToolMetadata[] = connection.tools.map(tool => ({
-      name: formatToolName(tool.name, name, prefix),
-      originalName: tool.name,
-      description: tool.description ?? "",
-      inputSchema: tool.inputSchema,
-    }));
-    // Add resource tools to metadata
-    for (const resource of connection.resources) {
-      if (definition.exposeResources !== false) {
-        const baseName = `get_${resourceNameToToolName(resource.name)}`;
-        metadata.push({
-          name: formatToolName(baseName, name, prefix),
-          originalName: baseName,
-          description: resource.description ?? `Read resource: ${resource.uri}`,
-          resourceUri: resource.uri,
-        });
-      }
-    }
+
+    const { metadata, failedTools } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix);
     toolMetadata.set(name, metadata);
-    
-    // Mark keep-alive servers
-    if (definition.lifecycle === "keep-alive") {
-      lifecycle.markKeepAlive(name, definition);
-    }
-    
+    updateMetadataCache(state, name);
+
     if (failedTools.length > 0 && ctx.hasUI) {
       ctx.ui.notify(
         `MCP: ${name} - ${failedTools.length} tools skipped`,
@@ -795,22 +976,34 @@ async function initializeMcp(
       );
     }
   }
-  
+
   // Summary notification
   const connectedCount = results.filter(r => r.connection).length;
   const failedCount = results.filter(r => r.error).length;
   if (ctx.hasUI && connectedCount > 0) {
-    const totalTools = [...registeredTools.values()].flat().length;
-    const msg = failedCount > 0 
-      ? `MCP: ${connectedCount}/${serverEntries.length} servers connected (${totalTools} tools)`
+    const totalTools = totalToolCount(state);
+    const msg = failedCount > 0
+      ? `MCP: ${connectedCount}/${startupServers.length} servers connected (${totalTools} tools)`
       : `MCP: ${connectedCount} servers connected (${totalTools} tools)`;
     ctx.ui.notify(msg, "info");
   }
-  
-  // Start health checks for keep-alive servers
+
+  lifecycle.setReconnectCallback((serverName) => {
+    updateServerMetadata(state, serverName);
+    updateMetadataCache(state, serverName);
+    state.failureTracker.delete(serverName);
+    updateStatusBar(state);
+  });
+
+  lifecycle.setIdleShutdownCallback((serverName) => {
+    const idleMinutes = getEffectiveIdleTimeoutMinutes(state, serverName);
+    console.log(`MCP: ${serverName} shut down (idle ${idleMinutes}m)`);
+    updateStatusBar(state);
+  });
+
   lifecycle.startHealthChecks();
-  
-  return { manager, lifecycle, registeredTools, toolMetadata, config };
+
+  return state;
 }
 
 /**
@@ -825,42 +1018,8 @@ function updateServerMetadata(state: McpExtensionState, serverName: string): voi
   if (!definition) return;
   
   const prefix = state.config.settings?.toolPrefix ?? "server";
-  
-  // Collect tool names
-  const { collected: toolNames } = collectToolNames(
-    connection.tools,
-    { serverName, prefix }
-  );
-  
-  // Collect resource tool names if enabled
-  if (definition.exposeResources !== false && connection.resources.length > 0) {
-    const resourceToolNames = collectResourceToolNames(
-      connection.resources,
-      { serverName, prefix }
-    );
-    toolNames.push(...resourceToolNames);
-  }
-  
-  state.registeredTools.set(serverName, toolNames);
-  
-  // Update tool metadata (include inputSchema for describe/errors)
-  const metadata: ToolMetadata[] = connection.tools.map(tool => ({
-    name: formatToolName(tool.name, serverName, prefix),
-    originalName: tool.name,
-    description: tool.description ?? "",
-    inputSchema: tool.inputSchema,
-  }));
-  for (const resource of connection.resources) {
-    if (definition.exposeResources !== false) {
-      const baseName = `get_${resourceNameToToolName(resource.name)}`;
-      metadata.push({
-        name: formatToolName(baseName, serverName, prefix),
-        originalName: baseName,
-        description: resource.description ?? `Read resource: ${resource.uri}`,
-        resourceUri: resource.uri,
-      });
-    }
-  }
+
+  const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
   state.toolMetadata.set(serverName, metadata);
 }
 
@@ -872,11 +1031,25 @@ async function showStatus(state: McpExtensionState, ctx: ExtensionContext): Prom
   // Show all configured servers, not just connected ones
   for (const name of Object.keys(state.config.mcpServers)) {
     const connection = state.manager.getConnection(name);
-    const toolNames = state.registeredTools.get(name) ?? [];
-    const status = connection?.status ?? "not connected";
-    const statusIcon = status === "connected" ? "✓" : "○";
-    
-    lines.push(`${statusIcon} ${name}: ${status} (${toolNames.length} tools)`);
+    const toolCount = getToolNames(state, name).length;
+    const failedAgo = getFailureAgeSeconds(state, name);
+    let status = "not connected";
+    let statusIcon = "○";
+    let failed = false;
+
+    if (connection?.status === "connected") {
+      status = "connected";
+      statusIcon = "✓";
+    } else if (failedAgo !== null) {
+      status = `failed ${failedAgo}s ago`;
+      statusIcon = "✗";
+      failed = true;
+    } else if (state.toolMetadata.has(name)) {
+      status = "cached";
+    }
+
+    const toolSuffix = failed ? "" : ` (${toolCount} tools${status === "cached" ? ", cached" : ""})`;
+    lines.push(`${statusIcon} ${name}: ${status}${toolSuffix}`);
   }
   
   if (Object.keys(state.config.mcpServers).length === 0) {
@@ -889,7 +1062,7 @@ async function showStatus(state: McpExtensionState, ctx: ExtensionContext): Prom
 async function showTools(state: McpExtensionState, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
   
-  const allTools = [...state.registeredTools.values()].flat();
+  const allTools = [...state.toolMetadata.values()].flat().map(m => m.name);
   
   if (allTools.length === 0) {
     ctx.ui.notify("No MCP tools available", "info");
@@ -909,56 +1082,32 @@ async function showTools(state: McpExtensionState, ctx: ExtensionContext): Promi
 
 async function reconnectServers(
   state: McpExtensionState,
-  ctx: ExtensionContext
+  ctx: ExtensionContext,
+  targetServer?: string
 ): Promise<void> {
-  for (const [name, definition] of Object.entries(state.config.mcpServers)) {
+  if (targetServer && !state.config.mcpServers[targetServer]) {
+    if (ctx.hasUI) {
+      ctx.ui.notify(`Server "${targetServer}" not found in config`, "error");
+    }
+    return;
+  }
+
+  const entries = targetServer
+    ? [[targetServer, state.config.mcpServers[targetServer]] as [string, ServerEntry]]
+    : Object.entries(state.config.mcpServers);
+
+  for (const [name, definition] of entries) {
     try {
       await state.manager.close(name);
-      
-      // Clear old entries before reconnecting (in case reconnection fails)
-      state.registeredTools.delete(name);
-      state.toolMetadata.delete(name);
-      
+
       const connection = await state.manager.connect(name, definition);
       const prefix = state.config.settings?.toolPrefix ?? "server";
-      
-      // Collect tool names (NOT registered with Pi)
-      const { collected: toolNames, failed: failedTools } = collectToolNames(
-        connection.tools,
-        { serverName: name, prefix }
-      );
-      
-      // Collect resource tool names if enabled
-      if (definition.exposeResources !== false && connection.resources.length > 0) {
-        const resourceToolNames = collectResourceToolNames(
-          connection.resources,
-          { serverName: name, prefix }
-        );
-        toolNames.push(...resourceToolNames);
-      }
-      
-      state.registeredTools.set(name, toolNames);
-      
-      // Update tool metadata for searching (include inputSchema for describe/errors)
-      const metadata: ToolMetadata[] = connection.tools.map(tool => ({
-        name: formatToolName(tool.name, name, prefix),
-        originalName: tool.name,
-        description: tool.description ?? "",
-        inputSchema: tool.inputSchema,
-      }));
-      for (const resource of connection.resources) {
-        if (definition.exposeResources !== false) {
-          const baseName = `get_${resourceNameToToolName(resource.name)}`;
-          metadata.push({
-            name: formatToolName(baseName, name, prefix),
-            originalName: baseName,
-            description: resource.description ?? `Read resource: ${resource.uri}`,
-            resourceUri: resource.uri,
-          });
-        }
-      }
+
+      const { metadata, failedTools } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix);
       state.toolMetadata.set(name, metadata);
-      
+      updateMetadataCache(state, name);
+      state.failureTracker.delete(name);
+
       if (ctx.hasUI) {
         ctx.ui.notify(
           `MCP: Reconnected to ${name} (${connection.tools.length} tools, ${connection.resources.length} resources)`,
@@ -970,6 +1119,7 @@ async function reconnectServers(
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      state.failureTracker.set(name, Date.now());
       if (ctx.hasUI) {
         ctx.ui.notify(`MCP: Failed to reconnect to ${name}: ${message}`, "error");
       }
@@ -977,14 +1127,158 @@ async function reconnectServers(
   }
   
   // Update status bar with server count
-  if (ctx.hasUI) {
-    const serverCount = state.registeredTools.size;
-    if (serverCount > 0) {
-      const label = serverCount === 1 ? "server" : "servers";
-      ctx.ui.setStatus("mcp", ctx.ui.theme.fg("accent", `MCP: ${serverCount} ${label}`));
-    } else {
-      ctx.ui.setStatus("mcp", "");
+  updateStatusBar(state);
+}
+
+function buildToolMetadata(
+  tools: McpTool[],
+  resources: McpResource[],
+  definition: ServerEntry,
+  serverName: string,
+  prefix: "server" | "none" | "short"
+): { metadata: ToolMetadata[]; failedTools: string[] } {
+  const metadata: ToolMetadata[] = [];
+  const failedTools: string[] = [];
+
+  for (const tool of tools) {
+    if (!tool?.name) {
+      failedTools.push("(unnamed)");
+      continue;
     }
+    metadata.push({
+      name: formatToolName(tool.name, serverName, prefix),
+      originalName: tool.name,
+      description: tool.description ?? "",
+      inputSchema: tool.inputSchema,
+    });
+  }
+
+  if (definition.exposeResources !== false) {
+    for (const resource of resources) {
+      const baseName = `get_${resourceNameToToolName(resource.name)}`;
+      metadata.push({
+        name: formatToolName(baseName, serverName, prefix),
+        originalName: baseName,
+        description: resource.description ?? `Read resource: ${resource.uri}`,
+        resourceUri: resource.uri,
+      });
+    }
+  }
+
+  return { metadata, failedTools };
+}
+
+function updateMetadataCache(state: McpExtensionState, serverName: string): void {
+  const connection = state.manager.getConnection(serverName);
+  if (!connection || connection.status !== "connected") return;
+
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) return;
+
+  const configHash = computeServerHash(definition);
+  const existing = loadMetadataCache();
+  const existingEntry = existing?.servers?.[serverName];
+
+  const tools = serializeTools(connection.tools);
+  let resources = definition.exposeResources === false ? [] : serializeResources(connection.resources);
+
+  if (
+    definition.exposeResources !== false &&
+    resources.length === 0 &&
+    existingEntry?.resources?.length &&
+    existingEntry.configHash === configHash
+  ) {
+    resources = existingEntry.resources;
+  }
+
+  const entry: ServerCacheEntry = {
+    configHash,
+    tools,
+    resources,
+    cachedAt: Date.now(),
+  };
+
+  saveMetadataCache({ version: 1, servers: { [serverName]: entry } });
+}
+
+function flushMetadataCache(state: McpExtensionState): void {
+  for (const [name, connection] of state.manager.getAllConnections()) {
+    if (connection.status === "connected") {
+      updateMetadataCache(state, name);
+    }
+  }
+}
+
+function getToolNames(state: McpExtensionState, serverName: string): string[] {
+  return state.toolMetadata.get(serverName)?.map(m => m.name) ?? [];
+}
+
+function totalToolCount(state: McpExtensionState): number {
+  let count = 0;
+  for (const metadata of state.toolMetadata.values()) {
+    count += metadata.length;
+  }
+  return count;
+}
+
+function updateStatusBar(state: McpExtensionState): void {
+  const ui = state.ui;
+  if (!ui) return;
+  const total = Object.keys(state.config.mcpServers).length;
+  if (total === 0) {
+    ui.setStatus("mcp", "");
+    return;
+  }
+  const connectedCount = state.manager.getAllConnections().size;
+  ui.setStatus("mcp", ui.theme.fg("accent", `MCP: ${connectedCount}/${total} servers`));
+}
+
+function getFailureAgeSeconds(state: McpExtensionState, serverName: string): number | null {
+  const failedAt = state.failureTracker.get(serverName);
+  if (!failedAt) return null;
+  const ageMs = Date.now() - failedAt;
+  if (ageMs > FAILURE_BACKOFF_MS) return null;
+  return Math.round(ageMs / 1000);
+}
+
+function getEffectiveIdleTimeoutMinutes(state: McpExtensionState, serverName: string): number {
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) {
+    return typeof state.config.settings?.idleTimeout === "number" ? state.config.settings.idleTimeout : 10;
+  }
+  if (typeof definition.idleTimeout === "number") return definition.idleTimeout;
+  const mode = definition.lifecycle ?? "lazy";
+  if (mode === "eager") return 0;
+  return typeof state.config.settings?.idleTimeout === "number" ? state.config.settings.idleTimeout : 10;
+}
+
+async function lazyConnect(state: McpExtensionState, serverName: string): Promise<boolean> {
+  const connection = state.manager.getConnection(serverName);
+  if (connection?.status === "connected") {
+    updateServerMetadata(state, serverName);
+    return true;
+  }
+
+  const failedAgo = getFailureAgeSeconds(state, serverName);
+  if (failedAgo !== null) return false;
+
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) return false;
+
+  try {
+    if (state.ui) {
+      state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
+    }
+    await state.manager.connect(serverName, definition);
+    state.failureTracker.delete(serverName);
+    updateServerMetadata(state, serverName);
+    updateMetadataCache(state, serverName);
+    updateStatusBar(state);
+    return true;
+  } catch {
+    state.failureTracker.set(serverName, Date.now());
+    updateStatusBar(state);
+    return false;
   }
 }
 

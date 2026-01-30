@@ -66,7 +66,8 @@ export interface ServerEntry {
   auth?: "oauth" | "bearer";
   bearerToken?: string;
   bearerTokenEnv?: string;
-  lifecycle?: "keep-alive" | "ephemeral";
+  lifecycle?: "keep-alive" | "lazy" | "eager";
+  idleTimeout?: number; // minutes, overrides global setting
   // Resource handling
   exposeResources?: boolean;
   // Debug
@@ -76,6 +77,7 @@ export interface ServerEntry {
 // Settings
 export interface McpSettings {
   toolPrefix?: "server" | "none" | "short";
+  idleTimeout?: number; // minutes, default 10, 0 to disable
 }
 
 // Root config
@@ -88,6 +90,30 @@ export interface McpConfig {
 // Alias for clarity
 export type ServerDefinition = ServerEntry;
 
+export interface ToolMetadata {
+  name: string;           // Prefixed tool name (e.g., "xcodebuild_list_sims")
+  originalName: string;   // Original MCP tool name (e.g., "list_sims")
+  description: string;
+  resourceUri?: string;   // For resource tools: the URI to read
+  inputSchema?: unknown;  // JSON Schema for parameters (stored for describe/errors)
+}
+
+/**
+ * Get server prefix based on tool prefix mode.
+ */
+export function getServerPrefix(
+  serverName: string,
+  mode: "server" | "none" | "short"
+): string {
+  if (mode === "none") return "";
+  if (mode === "short") {
+    let short = serverName.replace(/-?mcp$/i, "").replace(/-/g, "_");
+    if (!short) short = "mcp";
+    return short;
+  }
+  return serverName.replace(/-/g, "_");
+}
+
 /**
  * Format a tool name with server prefix.
  */
@@ -96,17 +122,6 @@ export function formatToolName(
   serverName: string,
   prefix: "server" | "none" | "short"
 ): string {
-  switch (prefix) {
-    case "none":
-      return toolName;
-    case "short":
-      let short = serverName.replace(/-?mcp$/i, "").replace(/-/g, "_");
-      // Fallback if server name was just "mcp" or similar
-      if (!short) short = "mcp";
-      return `${short}_${toolName}`;
-    case "server":
-    default:
-      const normalized = serverName.replace(/-/g, "_");
-      return `${normalized}_${toolName}`;
-  }
+  const p = getServerPrefix(serverName, prefix);
+  return p ? `${p}_${toolName}` : toolName;
 }

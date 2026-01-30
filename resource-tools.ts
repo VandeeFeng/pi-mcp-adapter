@@ -1,32 +1,4 @@
-// resource-tools.ts - MCP resource tool name collection
-// NOTE: Resources are NOT registered as Pi tools - they're called via the `mcp` proxy.
-
-import { formatToolName, type McpResource } from "./types.js";
-
-interface ResourceCollectionOptions {
-  serverName: string;
-  prefix: "server" | "none" | "short";
-}
-
-/**
- * Collect tool names for MCP resources.
- * Does NOT register with Pi - resources are called via the `mcp` proxy.
- */
-export function collectResourceToolNames(
-  resources: McpResource[],
-  options: ResourceCollectionOptions
-): string[] {
-  const collected: string[] = [];
-  const { serverName, prefix } = options;
-  
-  for (const resource of resources) {
-    const baseName = `get_${resourceNameToToolName(resource.name)}`;
-    const toolName = formatToolName(baseName, serverName, prefix);
-    collected.push(toolName);
-  }
-  
-  return collected;
-}
+// resource-tools.ts - MCP resource name utilities
 
 export function resourceNameToToolName(name: string): string {
   let result = name

@@ -1,39 +1,8 @@
-// tool-registrar.ts - MCP tool metadata and content transformation
+// tool-registrar.ts - MCP content transformation
 // NOTE: Tools are NOT registered with Pi - only the unified `mcp` proxy tool is registered.
 // This keeps the LLM context small (1 tool instead of 100s).
 
-import type { McpTool, McpContent, ContentBlock } from "./types.js";
-import { formatToolName } from "./types.js";
-
-interface ToolCollectionOptions {
-  serverName: string;
-  prefix: "server" | "none" | "short";
-}
-
-/**
- * Collect tool names from MCP server tools.
- * Does NOT register with Pi - tools are called via the `mcp` proxy.
- */
-export function collectToolNames(
-  tools: McpTool[],
-  options: ToolCollectionOptions
-): { collected: string[]; failed: string[] } {
-  const collected: string[] = [];
-  const failed: string[] = [];
-  
-  for (const tool of tools) {
-    // Basic validation - tool must have a name
-    if (!tool.name) {
-      failed.push("(unnamed)");
-      continue;
-    }
-    
-    const toolName = formatToolName(tool.name, options.serverName, options.prefix);
-    collected.push(toolName);
-  }
-  
-  return { collected, failed };
-}
+import type { McpContent, ContentBlock } from "./types.js";
 
 /**
  * Transform MCP content types to Pi content blocks.

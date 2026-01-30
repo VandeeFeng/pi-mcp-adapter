@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { McpTool, McpResource, ServerDefinition, Transport } from "./types.js";
 import { getStoredTokens } from "./oauth-handler.js";
+import { resolveNpxBinary } from "./npx-resolver.js";
 
 interface ServerConnection {
   client: Client;
@@ -13,6 +14,7 @@ interface ServerConnection {
   tools: McpTool[];
   resources: McpResource[];
   lastUsedAt: number;
+  inFlight: number;
   status: "connected" | "closed";
 }
 
@@ -54,10 +56,21 @@ export class McpServerManager {
     let transport: Transport;
     
     if (definition.command) {
-      // Stdio transport
+      let command = definition.command;
+      let args = definition.args ?? [];
+
+      if (command === "npx" || command === "npm") {
+        const resolved = await resolveNpxBinary(command, args);
+        if (resolved) {
+          command = resolved.isJs ? "node" : resolved.binPath;
+          args = resolved.isJs ? [resolved.binPath, ...resolved.extraArgs] : resolved.extraArgs;
+          console.log(`MCP: ${name} resolved to ${resolved.binPath} (skipping npm parent)`);
+        }
+      }
+
       transport = new StdioClientTransport({
-        command: definition.command,
-        args: definition.args ?? [],
+        command,
+        args,
         env: resolveEnv(definition.env),
         cwd: definition.cwd,
         stderr: definition.debug ? "inherit" : "ignore",
@@ -85,6 +98,7 @@ export class McpServerManager {
         tools,
         resources,
         lastUsedAt: Date.now(),
+        inFlight: 0,
         status: "connected",
       };
     } catch (error) {
@@ -181,11 +195,13 @@ export class McpServerManager {
     const connection = this.connections.get(name);
     if (!connection) return;
     
+    // Delete from map BEFORE async cleanup to prevent a race where a
+    // concurrent connect() creates a new connection that our deferred
+    // delete() would then remove, orphaning the new server process.
     connection.status = "closed";
-    // Close both independently - don't let one failure prevent the other
+    this.connections.delete(name);
     await connection.client.close().catch(() => {});
     await connection.transport.close().catch(() => {});
-    this.connections.delete(name);
   }
   
   async closeAll(): Promise<void> {
@@ -199,6 +215,34 @@ export class McpServerManager {
   
   getAllConnections(): Map<string, ServerConnection> {
     return new Map(this.connections);
+  }
+
+  touch(name: string): void {
+    const connection = this.connections.get(name);
+    if (connection) {
+      connection.lastUsedAt = Date.now();
+    }
+  }
+
+  incrementInFlight(name: string): void {
+    const connection = this.connections.get(name);
+    if (connection) {
+      connection.inFlight = (connection.inFlight ?? 0) + 1;
+    }
+  }
+
+  decrementInFlight(name: string): void {
+    const connection = this.connections.get(name);
+    if (connection && connection.inFlight) {
+      connection.inFlight--;
+    }
+  }
+
+  isIdle(name: string, timeoutMs: number): boolean {
+    const connection = this.connections.get(name);
+    if (!connection || connection.status !== "connected") return false;
+    if (connection.inFlight && connection.inFlight > 0) return false;
+    return (Date.now() - connection.lastUsedAt) > timeoutMs;
   }
 }
 
