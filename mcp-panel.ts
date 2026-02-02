@@ -8,7 +8,6 @@ interface PanelTheme {
   title: string;
   selected: string;
   direct: string;
-  failed: string;
   needsAuth: string;
   placeholder: string;
   description: string;
@@ -22,7 +21,6 @@ const DEFAULT_THEME: PanelTheme = {
   title: "2",
   selected: "36",
   direct: "32",
-  failed: "31",
   needsAuth: "33",
   placeholder: "2;3",
   description: "2",
@@ -649,34 +647,22 @@ class McpPanel {
     const expandIcon = server.expanded ? "▾" : "▸";
     const prefix = isCursor ? fg(t.selected, expandIcon) : fg(t.border, server.expanded ? expandIcon : "·");
 
-    let statusStr: string;
-    switch (server.connectionStatus) {
-      case "connected":
-        statusStr = fg(t.direct, "●") + " " + fg(t.direct, "connected");
-        break;
-      case "idle":
-        statusStr = fg(t.description, "○") + " " + fg(t.description, "idle");
-        break;
-      case "failed":
-        statusStr = fg(t.failed, "✕") + " " + fg(t.failed, "failed");
-        break;
-      case "needs-auth":
-        statusStr = fg(t.needsAuth, "⚷") + " " + fg(t.needsAuth, "needs auth");
-        break;
-      case "connecting":
-        statusStr = fg(t.description, "⋯") + " " + fg(t.description, "connecting");
-        break;
-    }
-
     const nameStr = isCursor ? bold(fg(t.selected, server.name)) : server.name;
     const importLabel = server.source === "import" ? fg(t.description, ` (${server.importKind ?? "import"})`) : "";
 
     if (!server.hasCachedData) {
-      return `${prefix} ${nameStr}${importLabel}  ${statusStr}  ${fg(t.description, "(not cached)")}`;
+      return `${prefix}   ${nameStr}${importLabel}  ${fg(t.description, "(not cached)")}`;
     }
 
     const directCount = server.tools.filter((t) => t.isDirect).length;
     const totalCount = server.tools.length;
+    let toggleIcon = fg(t.description, "○");
+    if (directCount === totalCount && totalCount > 0) {
+      toggleIcon = fg(t.direct, "●");
+    } else if (directCount > 0) {
+      toggleIcon = fg(t.needsAuth, "◐");
+    }
+
     let toolInfo = "";
     if (totalCount > 0) {
       toolInfo = `${directCount}/${totalCount}`;
@@ -687,7 +673,7 @@ class McpPanel {
       toolInfo = fg(t.description, toolInfo);
     }
 
-    return `${prefix} ${nameStr}${importLabel}  ${statusStr}  ${toolInfo}`;
+    return `${prefix} ${toggleIcon} ${nameStr}${importLabel}  ${toolInfo}`;
   }
 
   private renderToolRow(tool: ToolState, isCursor: boolean, innerW: number): string {
