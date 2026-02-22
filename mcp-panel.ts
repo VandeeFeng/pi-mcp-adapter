@@ -85,6 +85,8 @@ interface ToolState {
   description: string;
   isDirect: boolean;
   wasDirect: boolean;
+  isDisabled: boolean;
+  wasDisabled: boolean;
   estimatedTokens: number;
 }
 
@@ -145,15 +147,20 @@ class McpPanel {
         toolFilter = globalDirect;
       }
 
+      const disabledSet = new Set(definition.disabledTools ?? config.settings?.disabledTools ?? []);
+
       const tools: ToolState[] = [];
       if (serverCache) {
         for (const tool of serverCache.tools ?? []) {
           const isDirect = toolFilter === true || (Array.isArray(toolFilter) && toolFilter.includes(tool.name));
+          const isDisabled = disabledSet.has(tool.name);
           tools.push({
             name: tool.name,
             description: tool.description ?? "",
             isDirect,
             wasDirect: isDirect,
+            isDisabled,
+            wasDisabled: isDisabled,
             estimatedTokens: estimateTokens(tool),
           });
         }
@@ -161,12 +168,15 @@ class McpPanel {
           for (const resource of serverCache.resources ?? []) {
             const baseName = `get_${resourceNameToToolName(resource.name)}`;
             const isDirect = toolFilter === true || (Array.isArray(toolFilter) && toolFilter.includes(baseName));
+            const isDisabled = disabledSet.has(baseName);
             const ct: CachedTool = { name: baseName, description: resource.description };
             tools.push({
               name: baseName,
               description: resource.description ?? `Read resource: ${resource.uri}`,
               isDirect,
               wasDirect: isDirect,
+              isDisabled,
+              wasDisabled: isDisabled,
               estimatedTokens: estimateTokens(ct),
             });
           }
@@ -194,7 +204,7 @@ class McpPanel {
     if (this.inactivityTimeout) clearTimeout(this.inactivityTimeout);
     this.inactivityTimeout = setTimeout(() => {
       this.cleanup();
-      this.done({ cancelled: true, changes: new Map() });
+      this.done({ cancelled: true, changes: new Map(), disabledToolsChanges: new Map() });
     }, McpPanel.INACTIVITY_MS);
   }
 
@@ -243,24 +253,35 @@ class McpPanel {
   }
 
   private updateDirty(): void {
-    this.dirty = this.servers.some((s) => s.tools.some((t) => t.isDirect !== t.wasDirect));
+    this.dirty = this.servers.some((s) => s.tools.some((t) => t.isDirect !== t.wasDirect || t.isDisabled !== t.wasDisabled));
   }
 
   private buildResult(): McpPanelResult {
-    const changes = new Map<string, true | string[] | false>();
+    const dirToolsChanges = new Map<string, true | string[] | false>();
+    const disToolsChanges = new Map<string, string[]>();
+
     for (const server of this.servers) {
-      const changed = server.tools.some((t) => t.isDirect !== t.wasDirect);
-      if (!changed) continue;
-      const directTools = server.tools.filter((t) => t.isDirect);
-      if (directTools.length === server.tools.length && server.tools.length > 0) {
-        changes.set(server.name, true);
-      } else if (directTools.length === 0) {
-        changes.set(server.name, false);
-      } else {
-        changes.set(server.name, directTools.map((t) => t.name));
+      const directChanged = server.tools.some((t) => t.isDirect !== t.wasDirect);
+      const disabledChanged = server.tools.some((t) => t.isDisabled !== t.wasDisabled);
+
+      if (directChanged) {
+        const directTools = server.tools.filter((t) => t.isDirect);
+        if (directTools.length === server.tools.length && server.tools.length > 0) {
+          dirToolsChanges.set(server.name, true);
+        } else if (directTools.length === 0) {
+          dirToolsChanges.set(server.name, false);
+        } else {
+          dirToolsChanges.set(server.name, directTools.map((t) => t.name));
+        }
+      }
+
+      if (disabledChanged) {
+        const disabledTools = server.tools.filter((t) => t.isDisabled).map((t) => t.name);
+        disToolsChanges.set(server.name, disabledTools);
       }
     }
-    return { changes, cancelled: false };
+
+    return { changes: dirToolsChanges, disabledToolsChanges: disToolsChanges, cancelled: false };
   }
 
   handleInput(data: string): void {
@@ -276,7 +297,7 @@ class McpPanel {
     // Global shortcuts — always work, even during desc search
     if (matchesKey(data, "ctrl+c")) {
       this.cleanup();
-      this.done({ cancelled: true, changes: new Map() });
+      this.done({ cancelled: true, changes: new Map(), disabledToolsChanges: new Map() });
       return;
     }
 
@@ -333,7 +354,7 @@ class McpPanel {
         return;
       }
       this.cleanup();
-      this.done({ cancelled: true, changes: new Map() });
+      this.done({ cancelled: true, changes: new Map(), disabledToolsChanges: new Map() });
       return;
     }
 
@@ -343,6 +364,17 @@ class McpPanel {
     if (matchesKey(data, "space")) {
       const item = this.visibleItems[this.cursorIndex];
       if (item) this.toggleItem(item);
+      return;
+    }
+
+    if (data === "d" || data === "D") {
+      const item = this.visibleItems[this.cursorIndex];
+      if (item?.type === "tool" && item.toolIndex !== undefined) {
+        const tool = this.servers[item.serverIndex].tools[item.toolIndex];
+        tool.isDisabled = !tool.isDisabled;
+        if (tool.isDisabled) tool.isDirect = false;
+        this.updateDirty();
+      }
       return;
     }
 
@@ -361,6 +393,7 @@ class McpPanel {
       } else if (item.toolIndex !== undefined) {
         const tool = server.tools[item.toolIndex];
         tool.isDirect = !tool.isDirect;
+        if (tool.isDirect) tool.isDisabled = false;
         if (tool.isDirect && server.source === "import") {
           this.importNotice = `Imported from ${server.importKind ?? "external"} — will copy to user config on save`;
         }
@@ -426,10 +459,14 @@ class McpPanel {
       if (server.source === "import" && newState) {
         this.importNotice = `Imported from ${server.importKind ?? "external"} — will copy to user config on save`;
       }
-      for (const t of server.tools) t.isDirect = newState;
+      for (const t of server.tools) {
+        t.isDirect = newState;
+        if (newState) t.isDisabled = false;
+      }
     } else if (item.toolIndex !== undefined) {
       const tool = server.tools[item.toolIndex];
       tool.isDirect = !tool.isDirect;
+      if (tool.isDirect) tool.isDisabled = false;
       if (tool.isDirect && server.source === "import") {
         this.importNotice = `Imported from ${server.importKind ?? "external"} — will copy to user config on save`;
       }
@@ -440,7 +477,7 @@ class McpPanel {
   private handleDiscardInput(data: string): void {
     if (matchesKey(data, "ctrl+c")) {
       this.cleanup();
-      this.done({ cancelled: true, changes: new Map() });
+      this.done({ cancelled: true, changes: new Map(), disabledToolsChanges: new Map() });
       return;
     }
     if (matchesKey(data, "escape") || data === "n" || data === "N") {
@@ -450,7 +487,7 @@ class McpPanel {
     if (matchesKey(data, "return")) {
       if (this.discardSelected === 0) {
         this.cleanup();
-        this.done({ cancelled: true, changes: new Map() });
+        this.done({ cancelled: true, changes: new Map(), disabledToolsChanges: new Map() });
       } else {
         this.confirmingDiscard = false;
       }
@@ -458,7 +495,7 @@ class McpPanel {
     }
     if (data === "y" || data === "Y") {
       this.cleanup();
-      this.done({ cancelled: true, changes: new Map() });
+      this.done({ cancelled: true, changes: new Map(), disabledToolsChanges: new Map() });
       return;
     }
     if (matchesKey(data, "left") || matchesKey(data, "right") || matchesKey(data, "tab")) {
@@ -472,32 +509,35 @@ class McpPanel {
   }
 
   private rebuildServerTools(server: ServerState, entry: ServerCacheEntry): void {
-    const existingState = new Map<string, boolean>();
-    for (const t of server.tools) existingState.set(t.name, t.isDirect);
+    const preState = new Map<string, { isDirect: boolean; wasDirect: boolean; isDisabled: boolean; wasDisabled: boolean }>();
+    for (const t of server.tools) {
+      preState.set(t.name, { isDirect: t.isDirect, wasDirect: t.wasDirect, isDisabled: t.isDisabled, wasDisabled: t.wasDisabled });
+    }
+
+    function getToolState(name: string) {
+      const prev = preState.get(name);
+      return prev ?? { isDirect: false, wasDirect: false, isDisabled: false, wasDisabled: false };
+    }
 
     const newTools: ToolState[] = [];
     for (const tool of entry.tools ?? []) {
-      const prev = existingState.get(tool.name);
-      const isDirect = prev !== undefined ? prev : false;
+      const state = getToolState(tool.name);
       newTools.push({
         name: tool.name,
         description: tool.description ?? "",
-        isDirect,
-        wasDirect: prev !== undefined ? server.tools.find((t) => t.name === tool.name)?.wasDirect ?? false : false,
+        ...state,
         estimatedTokens: estimateTokens(tool),
       });
     }
 
     for (const resource of entry.resources ?? []) {
       const baseName = `get_${resourceNameToToolName(resource.name)}`;
-      const prev = existingState.get(baseName);
-      const isDirect = prev !== undefined ? prev : false;
+      const state = getToolState(baseName);
       const ct: CachedTool = { name: baseName, description: resource.description };
       newTools.push({
         name: baseName,
         description: resource.description ?? `Read resource: ${resource.uri}`,
-        isDirect,
-        wasDirect: prev !== undefined ? server.tools.find((t) => t.name === baseName)?.wasDirect ?? false : false,
+        ...state,
         estimatedTokens: estimateTokens(ct),
       });
     }
@@ -596,19 +636,22 @@ class McpPanel {
       lines.push(row(`Discard unsaved changes?  ${discardBtn}   ${keepBtn}`));
     } else {
       const directCount = this.servers.reduce((sum, s) => sum + s.tools.filter((t) => t.isDirect).length, 0);
+      const disabledCount = this.servers.reduce((sum, s) => sum + s.tools.filter((t) => t.isDisabled).length, 0);
       const totalTokens = this.servers.reduce(
         (sum, s) => sum + s.tools.filter((t) => t.isDirect).reduce((ts, t) => ts + t.estimatedTokens, 0),
         0,
       );
       const stats =
         directCount > 0 ? `${directCount} direct  ~${totalTokens.toLocaleString()} tokens` : "no direct tools";
-      lines.push(row(fg(t.description, stats + (this.dirty ? fg(t.needsAuth, "  (unsaved)") : ""))));
+      const disabledStats = disabledCount > 0 ? fg(t.needsAuth, `  ${disabledCount} disabled`) : "";
+      lines.push(row(fg(t.description, stats + disabledStats + (this.dirty ? fg(t.needsAuth, "  (unsaved)") : ""))));
     }
 
     lines.push(emptyRow());
     const hints = [
       italic("↑↓") + " navigate",
-      italic("space") + " toggle",
+      italic("space") + " direct",
+      italic("d") + " disable",
       italic("⏎") + " expand",
       italic("ctrl+r") + " reconnect",
       italic("?") + " desc search",
@@ -680,7 +723,9 @@ class McpPanel {
     const t = this.t;
     const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
 
-    const toggleIcon = tool.isDirect ? fg(t.direct, "●") : fg(t.description, "○");
+    const toggleIcon = tool.isDisabled 
+      ? fg(t.cancel, "✕") 
+      : (tool.isDirect ? fg(t.direct, "●") : fg(t.description, "○"));
     const cursor = isCursor ? fg(t.selected, "▸") : " ";
     const nameStr = isCursor ? bold(fg(t.selected, tool.name)) : tool.name;
 

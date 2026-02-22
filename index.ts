@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext, Theme, ToolInfo } from "@mariozech
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
-import { loadMcpConfig, getServerProvenance, writeDirectToolsConfig } from "./config.js";
+import { loadMcpConfig, getServerProvenance, writeMcpToolsConfig } from "./config.js";
 import { formatToolName, getServerPrefix, type McpConfig, type McpContent, type ToolMetadata, type McpTool, type McpResource, type ServerEntry, type DirectToolSpec, type McpPanelCallbacks, type McpPanelResult } from "./types.js";
 import { McpServerManager } from "./server-manager.js";
 import { McpLifecycleManager } from "./lifecycle.js";
@@ -59,7 +59,7 @@ function renderMcpToolResult(
     theme: Theme
 ): Text {
     const details = result.details as { error?: string } | undefined;
-    const textContent = result.content.find(c => c.type === "text") as { type: string; text?: string } | undefined;
+    const textContent = (result.content as Array<{ type?: string }>).find(c => c.type === "text") as { type: string; text?: string } | undefined;
 
     // Handle errors
     if (details?.error) {
@@ -170,10 +170,13 @@ function renderMcpToolResult(
         }
 
         const globalDirect = config.settings?.directTools;
+        const globalDisabled = config.settings?.disabledTools ?? [];
 
         for (const [serverName, definition] of Object.entries(config.mcpServers)) {
             const serverCache = cache.servers[serverName];
             if (!serverCache || !isServerCacheValid(serverCache, definition)) continue;
+
+            const disabledTools = new Set(definition.disabledTools ?? globalDisabled);
 
             let toolFilter: true | string[] | false = false;
 
@@ -194,6 +197,7 @@ function renderMcpToolResult(
             if (!toolFilter) continue;
 
             for (const tool of serverCache.tools ?? []) {
+                if (disabledTools.has(tool.name)) continue;
                 if (toolFilter !== true && !toolFilter.includes(tool.name)) continue;
                 const prefixedName = formatToolName(tool.name, serverName, prefix);
                 if (BUILTIN_NAMES.has(prefixedName)) {
@@ -217,6 +221,7 @@ function renderMcpToolResult(
             if (definition.exposeResources !== false) {
                 for (const resource of serverCache.resources ?? []) {
                     const baseName = `get_${resourceNameToToolName(resource.name)}`;
+                    if (disabledTools.has(baseName)) continue;
                     if (toolFilter !== true && !toolFilter.includes(baseName)) continue;
                     const prefixedName = formatToolName(baseName, serverName, prefix);
                     if (BUILTIN_NAMES.has(prefixedName)) {
@@ -1535,10 +1540,16 @@ function renderMcpToolResult(
     ): { metadata: ToolMetadata[]; failedTools: string[] } {
         const metadata: ToolMetadata[] = [];
         const failedTools: string[] = [];
+        
+        const globalDisabled = definition.disabledTools ?? [];
+        const disabledTools = new Set(definition.disabledTools ?? globalDisabled);
 
         for (const tool of tools) {
             if (!tool?.name) {
                 failedTools.push("(unnamed)");
+                continue;
+            }
+            if (disabledTools.has(tool.name)) {
                 continue;
             }
             metadata.push({
@@ -1552,6 +1563,9 @@ function renderMcpToolResult(
         if (definition.exposeResources !== false) {
             for (const resource of resources) {
                 const baseName = `get_${resourceNameToToolName(resource.name)}`;
+                if (disabledTools.has(baseName)) {
+                    continue;
+                }
                 metadata.push({
                     name: formatToolName(baseName, serverName, prefix),
                     originalName: baseName,
@@ -1762,9 +1776,11 @@ function renderMcpToolResult(
             ctx.ui.custom(
                 (tui, _theme, _keybindings, done) => {
                     return createMcpPanel(config, cache, provenanceMap, callbacks, tui, (result: McpPanelResult) => {
-                        if (!result.cancelled && result.changes.size > 0) {
-                            writeDirectToolsConfig(result.changes, provenanceMap, config);
-                            ctx.ui.notify("Direct tools updated. Restart pi to apply.", "info");
+                        if (!result.cancelled) {
+                            if (result.changes.size > 0 || result.disabledToolsChanges.size > 0) {
+                                writeMcpToolsConfig(result.changes, result.disabledToolsChanges, provenanceMap, config);
+                                ctx.ui.notify("Tools config updated. Restart pi to apply.", "info");
+                            }
                         }
                         done();
                         resolve();

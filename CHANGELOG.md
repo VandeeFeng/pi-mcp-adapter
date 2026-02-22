@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.9] - 2026-02-22
+
+### Added
+- **Disabled tools** - Completely hide specific MCP tools from the agent using `disabledTools` config (per-server or global). Disabled tools are filtered from metadata cache and won't appear in search results. Useful for hiding dangerous or unwanted tools.
+
+### Changed
+- `/mcp` interactive panel now supports disabling tools: press `d` on a selected tool to toggle disabled state
+- Disabled tools display with `✕` icon in the tool list
+- Changes saved to config file on `Ctrl+S`
+
 ## [2.1.2] - 2026-02-03
 
 ### Changed

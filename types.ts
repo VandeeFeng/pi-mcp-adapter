@@ -72,6 +72,8 @@ export interface ServerEntry {
   exposeResources?: boolean;
   // Direct tool registration
   directTools?: boolean | string[];
+  // Disabled tools (completely hidden from the agent)
+  disabledTools?: string[];
   // Debug
   debug?: boolean;  // Show server stderr (default: false)
 }
@@ -81,6 +83,7 @@ export interface McpSettings {
   toolPrefix?: "server" | "none" | "short";
   idleTimeout?: number; // minutes, default 10, 0 to disable
   directTools?: boolean;
+  disabledTools?: string[];
 }
 
 // Root config
@@ -124,6 +127,7 @@ export interface McpPanelCallbacks {
 
 export interface McpPanelResult {
   changes: Map<string, true | string[] | false>;
+  disabledToolsChanges: Map<string, string[]>;
   cancelled: boolean;
 }
 

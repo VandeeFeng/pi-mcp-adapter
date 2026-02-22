@@ -118,7 +118,7 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
       servers = obj.mcpServers ?? obj["mcp-servers"];
       break;
     default:
-      return {};
+        return {};
   }
   
   if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
@@ -175,21 +175,49 @@ export function getServerProvenance(overridePath?: string): Map<string, ServerPr
   return provenance;
 }
 
-export function writeDirectToolsConfig(
-  changes: Map<string, true | string[] | false>,
+interface ServerConfigChange {
+  serverName: string;
+  directTools?: true | string[] | false;
+  disabledTools?: string[];
+  prov: ServerProvenance;
+}
+
+export function writeMcpToolsConfig(
+  directToolsChanges: Map<string, true | string[] | false>,
+  disabledToolsChanges: Map<string, string[]>,
   provenance: Map<string, ServerProvenance>,
   fullConfig: McpConfig,
 ): void {
-  const byPath = new Map<string, { name: string; value: true | string[] | false; prov: ServerProvenance }[]>();
+  const byPath = new Map<string, ServerConfigChange[]>();
 
-  for (const [serverName, value] of changes) {
+  for (const [serverName, directTools] of directToolsChanges) {
     const prov = provenance.get(serverName);
     if (!prov) continue;
 
-    const targetPath = prov.path;
+    const entry = byPath.get(prov.path) ?? [];
+    byPath.set(prov.path, entry);
 
-    if (!byPath.has(targetPath)) byPath.set(targetPath, []);
-    byPath.get(targetPath)!.push({ name: serverName, value, prov });
+    const existing = entry.find(e => e.serverName === serverName);
+    if (existing) {
+      existing.directTools = directTools;
+    } else {
+      entry.push({ serverName, directTools, prov });
+    }
+  }
+
+  for (const [serverName, disabledTools] of disabledToolsChanges) {
+    const prov = provenance.get(serverName);
+    if (!prov) continue;
+
+    const entry = byPath.get(prov.path) ?? [];
+    byPath.set(prov.path, entry);
+
+    const existing = entry.find(e => e.serverName === serverName);
+    if (existing) {
+      existing.disabledTools = disabledTools;
+    } else {
+      entry.push({ serverName, disabledTools, prov });
+    }
   }
 
   for (const [filePath, entries] of byPath) {
@@ -204,14 +232,14 @@ export function writeDirectToolsConfig(
     const servers = (raw.mcpServers ?? raw["mcp-servers"] ?? {}) as Record<string, ServerEntry>;
     if (typeof servers !== "object" || Array.isArray(servers)) continue;
 
-    for (const { name, value, prov } of entries) {
+    for (const { serverName, directTools, disabledTools, prov } of entries) {
       if (prov.kind === "import") {
-        const fullDef = fullConfig.mcpServers[name];
+        const fullDef = fullConfig.mcpServers[serverName];
         if (fullDef) {
-          servers[name] = { ...fullDef, directTools: value };
+          servers[serverName] = { ...fullDef, directTools, disabledTools };
         }
-      } else if (servers[name]) {
-        servers[name] = { ...servers[name], directTools: value };
+      } else if (servers[serverName]) {
+        servers[serverName] = { ...servers[serverName], directTools, disabledTools };
       }
     }
 
