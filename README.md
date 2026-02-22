@@ -19,7 +19,7 @@ But the MCP ecosystem has useful stuff - databases, browsers, APIs. This adapter
 ## Install
 
 ```bash
-pi install npm:pi-mcp-adapter
+pi install npm:pi-tidy-mcp-adapter
 ```
 
 Restart Pi after installation.
@@ -90,6 +90,7 @@ Two calls instead of 26 tools cluttering the context.
 | `idleTimeout` | Minutes before idle disconnect (overrides global) |
 | `exposeResources` | Expose MCP resources as tools (default: true) |
 | `directTools` | `true`, `string[]`, or `false` — register tools individually instead of through proxy |
+| `disabledTools` | `string[]` — completely hide specific tools from the agent |
 | `debug` | Show server stderr (default: false) |
 
 ### Lifecycle Modes
@@ -115,6 +116,7 @@ Two calls instead of 26 tools cluttering the context.
 | `toolPrefix` | `"server"` (default), `"short"` (strips `-mcp` suffix), or `"none"` |
 | `idleTimeout` | Global idle timeout in minutes (default: 10, 0 to disable) |
 | `directTools` | Global default for all servers (default: false). Per-server overrides this. |
+| `disabledTools` | Global list of tools to disable. Per-server `disabledTools` adds to this list. |
 
 Per-server `idleTimeout` overrides the global setting.
 
@@ -172,7 +174,50 @@ Each direct tool costs ~150-300 tokens in the system prompt (name + description 
 
 Direct tools register from the metadata cache (`~/.pi/agent/mcp-cache.json`), so no server connections are needed at startup. On the first session after adding `directTools` to a new server, the cache won't exist yet — tools fall back to proxy-only and the cache populates in the background. Restart Pi and they'll be available. To force it: `/mcp reconnect <server>` then restart.
 
-**Interactive configuration:** Run `/mcp` to open an interactive panel showing all servers with connection status, tools, and direct/proxy toggles. You can reconnect servers, initiate OAuth, and toggle tools between direct and proxy — all from one overlay. Changes are written to your config file; restart Pi to apply.
+### Disabled Tools
+
+Completely hide specific MCP tools from the agent. Unlike `directTools` (which makes tools visible), `disabledTools` removes tools from search, metadata, and tool listings entirely. Useful for blocking dangerous operations or tools you don't want the agent to access.
+
+Per-server:
+
+```json
+{
+  "mcpServers": {
+    "dangerous-server": {
+      "command": "npx",
+      "args": ["-y", "risky-mcp@latest"],
+      "disabledTools": ["delete_everything", "format_hard_drive"]
+    },
+    "huge-server": {
+      "command": "npx",
+      "args": ["-y", "mega-mcp@latest"],
+      "directTools": true
+    }
+  }
+}
+```
+
+To set a global default:
+
+```json
+{
+  "settings": {
+    "disabledTools": ["dangerous_operation"]
+  },
+  "mcpServers": {
+    "huge-server": {
+      "directTools": true
+    }
+  }
+}
+```
+
+**Interaction with `directTools`:**
+- If a tool is both in `directTools` and `disabledTools`, `disabledTools` takes precedence — the tool is hidden
+- Setting a tool as disabled automatically removes it from direct registration
+- Setting a disabled tool as direct automatically re-enables it
+
+**Interactive configuration:** Run `/mcp` to open an interactive panel showing all servers with connection status, tools, and direct/proxy toggles. Press `d` on any tool to toggle its disabled state (disabled tools show with a ✕ icon). You can reconnect servers, initiate OAuth, and toggle tools between direct and proxy — all from one overlay. Changes are written to your config file; restart Pi to apply.
 
 **Subagent integration:** If you use the subagent extension, agents can request direct MCP tools in their frontmatter with `mcp:server-name` syntax. See the subagent README for details.
 
