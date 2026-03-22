@@ -77,7 +77,7 @@ function renderMcpToolResult(
         const remaining = lines.length - 1;
         if (remaining > 0) {
             return new Text(
-                `${theme.fg("muted", `... (${remaining} more lines,`)} ${keyHint("expandTools", "to expand")}${theme.fg("muted", ")")}`,
+                `${theme.fg("muted", `... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
                                            0, 0
                                           );
             }

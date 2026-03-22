@@ -1,6 +1,6 @@
 {
   "name": "pi-tidy-mcp-adapter",
-  "version": "0.0.9",
+  "version": "0.1.0",
   "description": "MCP (Model Context Protocol) adapter extension for Pi coding agent fork form https://github.com/nicobailon/pi-mcp-adapter",
   "type": "module",
   "license": "MIT",
