@@ -64,6 +64,17 @@ function renderMcpToolResult(
     // Handle errors
     if (details?.error) {
         const msg = textContent?.text ?? String(details.error);
+        const errorLines = msg.split("\n");
+
+        // Collapsed view for errors
+        if (!options.expanded && errorLines.length > 1) {
+            const remaining = errorLines.length - 1;
+            return new Text(
+                `${theme.fg("error", `Error: ${errorLines[0]}`)} ${theme.fg("muted", `... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+                0, 0
+            );
+        }
+
         return new Text(theme.fg("error", `Error: ${msg}`), 0, 0);
     }
 
@@ -333,35 +344,23 @@ function renderMcpToolResult(
                 async execute(_toolCallId, params) {
                     if (!state && initPromise) {
                         try { state = await initPromise; } catch {
-                            return {
-                                content: [{ type: "text" as const, text: "MCP initialization failed" }],
-                                details: { error: "init_failed" },
-                            };
+                            throw new Error("MCP initialization failed");
                         }
                     }
                     if (!state) {
-                        return {
-                            content: [{ type: "text" as const, text: "MCP not initialized" }],
-                            details: { error: "not_initialized" },
-                        };
+                        throw new Error("MCP not initialized");
                     }
 
                     const s = state;
                     const connected = await lazyConnect(s, spec.serverName);
                     if (!connected) {
                         const failedAgo = getFailureAgeSeconds(s, spec.serverName);
-                        return {
-                            content: [{ type: "text" as const, text: `MCP server "${spec.serverName}" not available${failedAgo !== null ? ` (failed ${failedAgo}s ago)` : ""}` }],
-                            details: { error: "server_unavailable", server: spec.serverName },
-                        };
+                        throw new Error(`MCP server "${spec.serverName}" not available${failedAgo !== null ? ` (failed ${failedAgo}s ago)` : ""}`);
                     }
 
                     const connection = s.manager.getConnection(spec.serverName);
                     if (!connection || connection.status !== "connected") {
-                        return {
-                            content: [{ type: "text" as const, text: `MCP server "${spec.serverName}" not connected` }],
-                            details: { error: "not_connected", server: spec.serverName },
-                        };
+                        throw new Error(`MCP server "${spec.serverName}" not connected`);
                     }
 
                     try {
@@ -393,10 +392,7 @@ function renderMcpToolResult(
                             if (spec.inputSchema) {
                                 errorText += `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}`;
                             }
-                            return {
-                                content: [{ type: "text" as const, text: `Error: ${errorText}` }],
-                                details: { error: "tool_error", server: spec.serverName },
-                            };
+                            throw new Error(`Error: ${errorText}`);
                         }
 
                         return {
@@ -409,10 +405,7 @@ function renderMcpToolResult(
                         if (spec.inputSchema) {
                             errorText += `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}`;
                         }
-                        return {
-                            content: [{ type: "text" as const, text: errorText }],
-                            details: { error: "call_failed", server: spec.serverName },
-                        };
+                        throw new Error(errorText);
                     } finally {
                         s.manager.decrementInFlight(spec.serverName);
                         s.manager.touch(spec.serverName);
@@ -582,18 +575,10 @@ function renderMcpToolResult(
                         parsedArgs = JSON.parse(params.args);
                         if (typeof parsedArgs !== "object" || parsedArgs === null || Array.isArray(parsedArgs)) {
                             const gotType = Array.isArray(parsedArgs) ? "array" : parsedArgs === null ? "null" : typeof parsedArgs;
-                            return {
-                                content: [{ type: "text", text: `Invalid args: expected a JSON object, got ${gotType}` }],
-                                isError: true,
-                                details: { error: "invalid_args_type" },
-                            };
+                            throw new Error(`Invalid args: expected a JSON object, got ${gotType}`);
                         }
                     } catch (e) {
-                        return {
-                            content: [{ type: "text", text: `Invalid args JSON: ${e instanceof Error ? e.message : e}` }],
-                            isError: true,
-                            details: { error: "invalid_args" },
-                        };
+                        throw new Error(`Invalid args JSON: ${e instanceof Error ? e.message : e}`);
                     }
                 }
                 
@@ -602,17 +587,11 @@ function renderMcpToolResult(
                     try {
                         state = await initPromise;
                     } catch {
-                        return {
-                            content: [{ type: "text", text: "MCP initialization failed" }],
-                            details: { error: "init_failed" },
-                        };
+                        throw new Error("MCP initialization failed");
                     }
                 }
                 if (!state) {
-                    return {
-                        content: [{ type: "text", text: "MCP not initialized" }],
-                        details: { error: "not_initialized" },
-                    };
+                    throw new Error("MCP not initialized");
                 }
                 
                 // Mode resolution: tool > connect > describe > search > server > status
@@ -1210,10 +1189,7 @@ function renderMcpToolResult(
                     errorWithSchema += `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
                 }
 
-                return {
-                    content: [{ type: "text" as const, text: errorWithSchema }],
-                    details: { mode: "call", error: "tool_error", mcpResult: result },
-                };
+                throw new Error(errorWithSchema);
             }
 
             return {
@@ -1229,10 +1205,7 @@ function renderMcpToolResult(
                 errorWithSchema += `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
             }
 
-            return {
-                content: [{ type: "text" as const, text: errorWithSchema }],
-                details: { mode: "call", error: "call_failed", message },
-            };
+            throw new Error(errorWithSchema);
         } finally {
             state.manager.decrementInFlight(serverName);
             state.manager.touch(serverName);
