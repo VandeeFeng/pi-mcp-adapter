@@ -341,7 +341,7 @@ function renderMcpToolResult(
                     return renderMcpToolResult(result, { expanded }, theme);
                 },
 
-                async execute(_toolCallId, params) {
+                async execute(_toolCallId, params, signal) {
                     if (!state && initPromise) {
                         try { state = await initPromise; } catch {
                             throw new Error("MCP initialization failed");
@@ -368,7 +368,7 @@ function renderMcpToolResult(
                         s.manager.incrementInFlight(spec.serverName);
 
                         if (spec.resourceUri) {
-                            const result = await connection.client.readResource({ uri: spec.resourceUri });
+                            const result = await connection.client.readResource({ uri: spec.resourceUri }, { signal });
                             const content = (result.contents ?? []).map(c => ({
                                 type: "text" as const,
                                 text: "text" in c ? c.text : ("blob" in c ? `[Binary data: ${(c as { mimeType?: string }).mimeType ?? "unknown"}]` : JSON.stringify(c)),
@@ -382,7 +382,7 @@ function renderMcpToolResult(
                         const result = await connection.client.callTool({
                             name: spec.originalName,
                             arguments: params ?? {},
-                        });
+                        }, undefined, { signal });
 
                         const mcpContent = (result.content ?? []) as McpContent[];
                         const content = transformMcpContent(mcpContent);
@@ -567,7 +567,7 @@ function renderMcpToolResult(
                 regex?: boolean;
                 includeSchemas?: boolean;
                 server?: string;
-            }, _signal, _onUpdate, _ctx) {
+            }, signal, _onUpdate, _ctx) {
                 // Parse args from JSON string if provided
                 let parsedArgs: Record<string, unknown> | undefined;
                 if (params.args) {
@@ -596,7 +596,7 @@ function renderMcpToolResult(
                 
                 // Mode resolution: tool > connect > describe > search > server > status
                 if (params.tool) {
-                    return executeCall(state, params.tool, parsedArgs, params.server);
+                    return executeCall(state, params.tool, parsedArgs, params.server, signal);
                 }
                 if (params.connect) {
                     return executeConnect(state, params.connect);
@@ -1023,7 +1023,8 @@ function renderMcpToolResult(
         state: McpExtensionState,
         toolName: string,
         args?: Record<string, unknown>,
-        serverOverride?: string
+        serverOverride?: string,
+        signal?: AbortSignal
     ) {
         // Find the tool in metadata
         let serverName: string | undefined = serverOverride;
@@ -1157,7 +1158,7 @@ function renderMcpToolResult(
 
             // Resource tools use readResource, regular tools use callTool
             if (toolMeta.resourceUri) {
-                const result = await connection.client.readResource({ uri: toolMeta.resourceUri });
+                const result = await connection.client.readResource({ uri: toolMeta.resourceUri }, { signal });
                 const content = (result.contents ?? []).map(c => ({
                     type: "text" as const,
                     text: "text" in c ? c.text : ("blob" in c ? `[Binary data: ${(c as { mimeType?: string }).mimeType ?? "unknown"}]` : JSON.stringify(c)),
@@ -1172,7 +1173,7 @@ function renderMcpToolResult(
             const result = await connection.client.callTool({
                 name: toolMeta.originalName,
                 arguments: args ?? {},
-            });
+            }, undefined, { signal });
 
             const mcpContent = (result.content ?? []) as McpContent[];
             const content = transformMcpContent(mcpContent);
