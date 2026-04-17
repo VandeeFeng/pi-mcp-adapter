@@ -34,8 +34,11 @@ interface ParsedInvocation {
 
 export async function resolveNpxBinary(
   command: string,
-  args: string[]
+  args: string[],
+  signal?: AbortSignal
 ): Promise<NpxResolution | null> {
+  if (signal?.aborted) return null;
+
   const parsed = command === "npx"
     ? parseNpxArgs(args)
     : command === "npm"
@@ -59,7 +62,14 @@ export async function resolveNpxBinary(
   }
 
   // Slow path: force npx cache population
-  await forceNpxCache(parsed.packageSpec);
+  try {
+    await forceNpxCache(parsed.packageSpec, signal);
+  } catch {
+    // Ignore abort/errors, resolution will fall back to original command
+  }
+  
+  if (signal?.aborted) return null;
+  
   const resolvedAfterInstall = resolveFromNpmCache(parsed.packageSpec, parsed.binName);
   if (resolvedAfterInstall) {
     saveCacheEntry(cacheKey, resolvedAfterInstall);
@@ -229,25 +239,35 @@ function resolveFromNpmCache(packageSpec: string, binName?: string): NpxCacheEnt
 
 const FORCE_CACHE_TIMEOUT_MS = 30_000;
 
-async function forceNpxCache(packageSpec: string): Promise<void> {
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(
-        "npm",
-        ["exec", "--yes", "--package", packageSpec, "--", "node", "-e", "1"],
-        { stdio: "ignore" }
-      );
-      const timer = setTimeout(() => {
-        proc.kill();
-        reject(new Error("timeout"));
-      }, FORCE_CACHE_TIMEOUT_MS);
-      timer.unref();
-      proc.on("close", () => { clearTimeout(timer); resolve(); });
-      proc.on("error", (err) => { clearTimeout(timer); reject(err); });
-    });
-  } catch {
-    // Ignore failures, resolution will fall back to original command
+async function forceNpxCache(packageSpec: string, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+
+  let proc: ReturnType<typeof spawn> | undefined;
+
+  const abortHandler = () => {
+    if (proc) {
+      try { proc.kill(); } catch { /* ignore */ }
+    }
+  };
+
+  if (signal) {
+    signal.addEventListener("abort", abortHandler, { once: true });
   }
+
+  await new Promise<void>((resolve, reject) => {
+    proc = spawn(
+      "npm",
+      ["exec", "--yes", "--package", packageSpec, "--", "node", "-e", "1"],
+      { stdio: "ignore" }
+    );
+    const timer = setTimeout(() => {
+      proc.kill();
+      reject(new Error("timeout"));
+    }, FORCE_CACHE_TIMEOUT_MS);
+    timer.unref();
+    proc.on("close", () => { clearTimeout(timer); resolve(); });
+    proc.on("error", (err) => { clearTimeout(timer); reject(err); });
+  });
 }
 
 function buildBinCandidates(packageName: string, explicitBin?: string): string[] {

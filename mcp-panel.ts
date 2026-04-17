@@ -342,6 +342,16 @@ class McpPanel {
     }
 
     if (matchesKey(data, "escape")) {
+      // Check if selected server is connecting - cancel connection
+      const selectedItem = this.visibleItems[this.cursorIndex];
+      if (selectedItem?.type === "server") {
+        const server = this.servers[selectedItem.serverIndex];
+        if (server.connectionStatus === "connecting") {
+          server.connectionStatus = "idle";
+          this.callbacks.cancelConnect(server.name);
+          return;
+        }
+      }
       if (this.nameQuery) {
         this.nameQuery = "";
         this.rebuildVisibleItems();
@@ -656,7 +666,7 @@ class McpPanel {
       italic("ctrl+r") + " reconnect",
       italic("?") + " desc search",
       italic("ctrl+s") + " save",
-      italic("esc") + " clear/close",
+      italic("esc") + " cancel/close",
       italic("ctrl+c") + " quit",
     ];
     const gap = "  ";
@@ -692,6 +702,11 @@ class McpPanel {
 
     const nameStr = isCursor ? bold(fg(t.selected, server.name)) : server.name;
     const importLabel = server.source === "import" ? fg(t.description, ` (${server.importKind ?? "import"})`) : "";
+
+    // Show connecting status
+    if (server.connectionStatus === "connecting") {
+      return `${prefix}   ${nameStr}${importLabel}  ${fg(t.needsAuth, "(connecting...)")}`;
+    }
 
     if (!server.hasCachedData) {
       return `${prefix}   ${nameStr}${importLabel}  ${fg(t.description, "(not cached)")}`;

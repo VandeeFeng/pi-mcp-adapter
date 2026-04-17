@@ -121,6 +121,7 @@ export interface ServerProvenance {
 
 export interface McpPanelCallbacks {
   reconnect: (serverName: string) => Promise<boolean>;
+  cancelConnect: (serverName: string) => void;
   getConnectionStatus: (serverName: string) => "connected" | "idle" | "failed" | "needs-auth";
   refreshCacheAfterReconnect: (serverName: string) => import("./metadata-cache.js").ServerCacheEntry | null;
 }

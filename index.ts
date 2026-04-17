@@ -352,7 +352,7 @@ function renderMcpToolResult(
                     }
 
                     const s = state;
-                    const connected = await lazyConnect(s, spec.serverName);
+                    const connected = await lazyConnect(s, spec.serverName, signal);
                     if (!connected) {
                         const failedAgo = getFailureAgeSeconds(s, spec.serverName);
                         throw new Error(`MCP server "${spec.serverName}" not available${failedAgo !== null ? ` (failed ${failedAgo}s ago)` : ""}`);
@@ -599,7 +599,7 @@ function renderMcpToolResult(
                     return executeCall(state, params.tool, parsedArgs, params.server, signal);
                 }
                 if (params.connect) {
-                    return executeConnect(state, params.connect);
+                    return executeConnect(state, params.connect, signal);
                 }
                 if (params.describe) {
                     return executeDescribe(state, params.describe);
@@ -987,7 +987,7 @@ function renderMcpToolResult(
         };
     }
 
-    async function executeConnect(state: McpExtensionState, serverName: string) {
+    async function executeConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal) {
         const definition = state.config.mcpServers[serverName];
         if (!definition) {
             return {
@@ -1000,7 +1000,7 @@ function renderMcpToolResult(
             if (state.ui) {
                 state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
             }
-            const connection = await state.manager.connect(serverName, definition);
+            const connection = await state.manager.connect(serverName, definition, signal);
             const prefix = state.config.settings?.toolPrefix ?? "server";
             const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
             state.toolMetadata.set(serverName, metadata);
@@ -1010,6 +1010,7 @@ function renderMcpToolResult(
             return executeList(state, serverName);
         } catch (error) {
             state.failureTracker.set(serverName, Date.now());
+            state.ui?.setStatus("mcp", "");
             updateStatusBar(state);
             const message = error instanceof Error ? error.message : String(error);
             return {
@@ -1052,7 +1053,7 @@ function renderMcpToolResult(
         }
 
         if (serverName && !toolMeta) {
-            const connected = await lazyConnect(state, serverName);
+            const connected = await lazyConnect(state, serverName, signal);
             if (connected) {
                 toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
             } else {
@@ -1077,7 +1078,7 @@ function renderMcpToolResult(
             for (const { name: configuredServer } of candidates) {
                 const failedAgo = getFailureAgeSeconds(state, configuredServer);
                 if (failedAgo !== null) continue;
-                const connected = await lazyConnect(state, configuredServer);
+                const connected = await lazyConnect(state, configuredServer, signal);
                 if (!connected) continue;
                 if (!prefixMatchedServer) prefixMatchedServer = configuredServer;
                 toolMeta = findToolByName(state.toolMetadata.get(configuredServer), toolName);
@@ -1636,7 +1637,7 @@ function renderMcpToolResult(
         return typeof state.config.settings?.idleTimeout === "number" ? state.config.settings.idleTimeout : 10;
     }
 
-    async function lazyConnect(state: McpExtensionState, serverName: string): Promise<boolean> {
+    async function lazyConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal): Promise<boolean> {
         const connection = state.manager.getConnection(serverName);
         if (connection?.status === "connected") {
             updateServerMetadata(state, serverName);
@@ -1653,7 +1654,7 @@ function renderMcpToolResult(
             if (state.ui) {
                 state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
             }
-            await state.manager.connect(serverName, definition);
+            await state.manager.connect(serverName, definition, signal);
             state.failureTracker.delete(serverName);
             updateServerMetadata(state, serverName);
             updateMetadataCache(state, serverName);
@@ -1661,6 +1662,7 @@ function renderMcpToolResult(
             return true;
         } catch {
             state.failureTracker.set(serverName, Date.now());
+            state.ui?.setStatus("mcp", "");
             updateStatusBar(state);
             return false;
         }
@@ -1727,6 +1729,9 @@ function renderMcpToolResult(
         const callbacks: McpPanelCallbacks = {
             reconnect: async (serverName: string) => {
                 return lazyConnect(state, serverName);
+            },
+            cancelConnect: (serverName: string) => {
+                state.manager.cancelConnect(serverName);
             },
             getConnectionStatus: (serverName: string) => {
                 const definition = config.mcpServers[serverName];
