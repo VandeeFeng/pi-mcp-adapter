@@ -54,28 +54,42 @@ function renderMcpToolCall(
  * Render MCP tool result with error handling and expand/collapse.
  */
 function renderMcpToolResult(
-    result: { content: unknown[]; details?: { error?: string } },
+    result: { content?: unknown[]; details?: { error?: string }; message?: string } | Error,
     options: { expanded: boolean },
-    theme: Theme
+    theme: Theme,
+    context?: { isError?: boolean }
 ): Text {
-    const details = result.details as { error?: string } | undefined;
-    const textContent = (result.content as Array<{ type?: string }>).find(c => c.type === "text") as { type: string; text?: string } | undefined;
+    const thrownMessage = result instanceof Error
+        ? result.message
+        : typeof result?.message === "string"
+            ? result.message
+            : undefined;
 
-    // Handle errors
-    if (details?.error) {
-        const msg = textContent?.text ?? String(details.error);
+    const details = (result as { details?: { error?: string } })?.details;
+    const content = (result as { content?: unknown[] })?.content ?? [];
+    const textContent = (content as Array<{ type?: string }>).find(c => c.type === "text") as { type: string; text?: string } | undefined;
+
+    // Handle errors (thrown errors may arrive as text content with context.isError=true)
+    const errorMessage = details?.error ?? thrownMessage;
+    const isErrorResult = Boolean(errorMessage) || context?.isError === true;
+    if (isErrorResult) {
+        const rawMsg = textContent?.text ?? String(errorMessage ?? "Tool execution failed");
+        const msg = rawMsg.replace(/^Error:\s*/i, "");
         const errorLines = msg.split("\n");
+        const isCancellation = /\b(cancelled|canceled|aborted|abort)\b/i.test(msg);
+        const firstLine = isCancellation ? errorLines[0] : `Error: ${errorLines[0]}`;
+        const fullText = isCancellation ? msg : `Error: ${msg}`;
 
-        // Collapsed view for errors
+        // Collapsed view for multi-line errors
         if (!options.expanded && errorLines.length > 1) {
-            const remaining = errorLines.length - 1;
+            const remaining = errorLines.length;
             return new Text(
-                `${theme.fg("error", `Error: ${errorLines[0]}`)} ${theme.fg("muted", `... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+                `${theme.fg("muted", `... (${remaining} lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
                 0, 0
             );
         }
 
-        return new Text(theme.fg("error", `Error: ${msg}`), 0, 0);
+        return new Text(theme.fg("error", fullText), 0, 0);
     }
 
     const isEmpty = !textContent?.text || textContent.text.trim().length === 0
@@ -89,11 +103,11 @@ function renderMcpToolResult(
         if (remaining > 0) {
             return new Text(
                 `${theme.fg("muted", `... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
-                                           0, 0
-                                          );
-            }
-            return new Text(theme.fg("dim", "(empty)"), 0, 0);
+                0, 0
+            );
         }
+        return new Text(theme.fg("toolOutput", lines[0]), 0, 0);
+    }
 
         // Expanded view
         if (isEmpty) return new Text(theme.fg("dim", "(no output)"), 0, 0);
@@ -337,8 +351,8 @@ function renderMcpToolResult(
                     return renderMcpToolCall(spec.serverName, spec.originalName, theme, spec.resourceUri);
                 },
 
-                renderResult(result, { expanded }, theme: Theme) {
-                    return renderMcpToolResult(result, { expanded }, theme);
+                renderResult(result, { expanded }, theme: Theme, context) {
+                    return renderMcpToolResult(result, { expanded }, theme, context);
                 },
 
                 async execute(_toolCallId, params, signal) {
@@ -388,11 +402,8 @@ function renderMcpToolResult(
                         const content = transformMcpContent(mcpContent);
 
                         if (result.isError) {
-                            let errorText = content.filter(c => c.type === "text").map(c => (c as { text: string }).text).join("\n") || "Tool execution failed";
-                            if (spec.inputSchema) {
-                                errorText += `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}`;
-                            }
-                            throw new Error(`Error: ${errorText}`);
+                            const errorText = content.filter(c => c.type === "text").map(c => (c as { text: string }).text).join("\n") || "Tool execution failed";
+                            throw new Error(buildToolErrorMessage(errorText, spec.inputSchema));
                         }
 
                         return {
@@ -401,11 +412,7 @@ function renderMcpToolResult(
                         };
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
-                        let errorText = `Failed to call tool: ${message}`;
-                        if (spec.inputSchema) {
-                            errorText += `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}`;
-                        }
-                        throw new Error(errorText);
+                        throw new Error(buildToolErrorMessage(message, spec.inputSchema));
                     } finally {
                         s.manager.decrementInFlight(spec.serverName);
                         s.manager.touch(spec.serverName);
@@ -554,8 +561,8 @@ function renderMcpToolResult(
                 return renderMcpToolCall("mcp", suffix, theme, undefined, { showColon: false });
             },
 
-            renderResult(result, { expanded }, theme: Theme) {
-                return renderMcpToolResult(result, { expanded }, theme);
+            renderResult(result, { expanded }, theme: Theme, context) {
+                return renderMcpToolResult(result, { expanded }, theme, context);
             },
 
             async execute(_toolCallId, params: {
@@ -682,10 +689,7 @@ function renderMcpToolResult(
         }
         
         if (!serverName || !toolMeta) {
-            return {
-                content: [{ type: "text" as const, text: `Tool "${toolName}" not found. Use mcp({ search: "..." }) to search.` }],
-                details: { mode: "describe", error: "tool_not_found", requestedTool: toolName },
-            };
+            throw new Error(`Tool "${toolName}" not found. Use mcp({ search: "..." }) to search.`);
         }
         
         let text = `${toolMeta.name}\n`;
@@ -816,19 +820,13 @@ function renderMcpToolResult(
                 // Split on whitespace and OR the terms (like most search engines)
                 const terms = query.trim().split(/\s+/).filter(t => t.length > 0);
                 if (terms.length === 0) {
-                    return {
-                        content: [{ type: "text" as const, text: "Search query cannot be empty" }],
-                        details: { mode: "search", error: "empty_query" },
-                    };
+                    throw new Error("Search query cannot be empty");
                 }
                 const escaped = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
                 pattern = new RegExp(escaped.join("|"), "i");
             }
         } catch {
-            return {
-                content: [{ type: "text" as const, text: `Invalid regex: ${query}` }],
-                details: { mode: "search", error: "invalid_pattern", query },
-            };
+            throw new Error(`Invalid regex: ${query}`);
         }
         
         // Search pi tools (unless server filter is specified)
@@ -932,10 +930,7 @@ function renderMcpToolResult(
 
     function executeList(state: McpExtensionState, server: string) {
         if (!state.config.mcpServers[server]) {
-            return {
-                content: [{ type: "text" as const, text: `Server "${server}" not found. Use mcp({}) to see available servers.` }],
-                details: { mode: "list", server, tools: [], count: 0, error: "not_found" },
-            };
+            throw new Error(`Server "${server}" not found. Use mcp({}) to see available servers.`);
         }
 
         const metadata = state.toolMetadata.get(server);
@@ -956,10 +951,7 @@ function renderMcpToolResult(
                     details: { mode: "list", server, tools: [], count: 0, cached: true },
                 };
             }
-            return {
-                content: [{ type: "text" as const, text: `Server "${server}" is configured but not connected. Use mcp({ connect: "${server}" }) or /mcp reconnect ${server} to retry.` }],
-                details: { mode: "list", server, tools: [], count: 0, error: "not_connected" },
-            };
+            throw new Error(`Server "${server}" is configured but not connected. Use mcp({ connect: "${server}" }) or /mcp reconnect ${server} to retry.`);
         }
 
         const cachedNote = connection?.status === "connected" ? "" : " (not connected, cached)";
@@ -990,10 +982,7 @@ function renderMcpToolResult(
     async function executeConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal) {
         const definition = state.config.mcpServers[serverName];
         if (!definition) {
-            return {
-                content: [{ type: "text" as const, text: `Server "${serverName}" not found. Use mcp({}) to see available servers.` }],
-                details: { mode: "connect", error: "not_found", server: serverName },
-            };
+            throw new Error(`Server "${serverName}" not found. Use mcp({}) to see available servers.`);
         }
 
         try {
@@ -1009,14 +998,16 @@ function renderMcpToolResult(
             updateStatusBar(state);
             return executeList(state, serverName);
         } catch (error) {
-            state.failureTracker.set(serverName, Date.now());
             state.ui?.setStatus("mcp", "");
             updateStatusBar(state);
+
+            if (isCancellationError(error, signal)) {
+                throw new Error(`Cancelled connecting to "${serverName}"`);
+            }
+
+            state.failureTracker.set(serverName, Date.now());
             const message = error instanceof Error ? error.message : String(error);
-            return {
-                content: [{ type: "text" as const, text: `Failed to connect to "${serverName}": ${message}` }],
-                details: { mode: "connect", error: "connect_failed", server: serverName, message },
-            };
+            throw new Error(`Failed to connect to "${serverName}": ${message}`);
         }
     }
 
@@ -1033,10 +1024,7 @@ function renderMcpToolResult(
         const prefixMode = state.config.settings?.toolPrefix ?? "server";
 
         if (serverName && !state.config.mcpServers[serverName]) {
-            return {
-                content: [{ type: "text" as const, text: `Server "${serverName}" not found. Use mcp({}) to see available servers.` }],
-                details: { mode: "call", error: "server_not_found", server: serverName },
-            };
+            throw new Error(`Server "${serverName}" not found. Use mcp({}) to see available servers.`);
         }
 
         if (serverName) {
@@ -1059,10 +1047,7 @@ function renderMcpToolResult(
             } else {
                 const failedAgo = getFailureAgeSeconds(state, serverName);
                 if (failedAgo !== null) {
-                    return {
-                        content: [{ type: "text" as const, text: `Server "${serverName}" not available (last failed ${failedAgo}s ago)` }],
-                        details: { mode: "call", error: "server_backoff", server: serverName },
-                    };
+                    throw new Error(`Server "${serverName}" not available (last failed ${failedAgo}s ago)`);
                 }
             }
         }
@@ -1098,28 +1083,19 @@ function renderMcpToolResult(
             } else {
                 msg += ` Use mcp({ search: "..." }) to search.`;
             }
-            return {
-                content: [{ type: "text" as const, text: msg }],
-                details: { mode: "call", error: "tool_not_found", requestedTool: toolName, hintServer },
-            };
+            throw new Error(msg);
         }
 
         let connection = state.manager.getConnection(serverName);
         if (!connection || connection.status !== "connected") {
             const failedAgo = getFailureAgeSeconds(state, serverName);
             if (failedAgo !== null) {
-                return {
-                    content: [{ type: "text" as const, text: `Server "${serverName}" not available (last failed ${failedAgo}s ago)` }],
-                    details: { mode: "call", error: "server_backoff", server: serverName },
-                };
+                throw new Error(`Server "${serverName}" not available (last failed ${failedAgo}s ago)`);
             }
 
             const definition = state.config.mcpServers[serverName];
             if (!definition) {
-                return {
-                    content: [{ type: "text" as const, text: `Server "${serverName}" not connected` }],
-                    details: { mode: "call", error: "server_not_connected", server: serverName },
-                };
+                throw new Error(`Server "${serverName}" not connected`);
             }
 
             try {
@@ -1137,19 +1113,13 @@ function renderMcpToolResult(
                     const hint = available.length > 0
                         ? `Available tools on "${serverName}": ${available.join(", ")}`
                         : `Server "${serverName}" has no tools.`;
-                    return {
-                        content: [{ type: "text" as const, text: `Tool "${toolName}" not found on "${serverName}" after reconnect. ${hint}` }],
-                        details: { mode: "call", error: "tool_not_found_after_reconnect", requestedTool: toolName },
-                    };
+                    throw new Error(`Tool "${toolName}" not found on "${serverName}" after reconnect. ${hint}`);
                 }
             } catch (error) {
                 state.failureTracker.set(serverName, Date.now());
                 updateStatusBar(state);
                 const message = error instanceof Error ? error.message : String(error);
-                return {
-                    content: [{ type: "text" as const, text: `Failed to connect to "${serverName}": ${message}` }],
-                    details: { mode: "call", error: "connect_failed", message },
-                };
+                throw new Error(`Failed to connect to "${serverName}": ${message}`);
             }
         }
 
@@ -1185,13 +1155,7 @@ function renderMcpToolResult(
                     .map((c) => (c as { text: string }).text)
                     .join("\n") || "Tool execution failed";
 
-                // Include schema in error to help LLM self-correct
-                let errorWithSchema = `Error: ${errorText}`;
-                if (toolMeta.inputSchema) {
-                    errorWithSchema += `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
-                }
-
-                throw new Error(errorWithSchema);
+                throw new Error(buildToolErrorMessage(errorText, toolMeta.inputSchema));
             }
 
             return {
@@ -1200,14 +1164,7 @@ function renderMcpToolResult(
             };
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-
-            // Include schema in error to help LLM self-correct
-            let errorWithSchema = `Failed to call tool: ${message}`;
-            if (toolMeta.inputSchema) {
-                errorWithSchema += `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
-            }
-
-            throw new Error(errorWithSchema);
+            throw new Error(buildToolErrorMessage(message, toolMeta.inputSchema));
         } finally {
             state.manager.decrementInFlight(serverName);
             state.manager.touch(serverName);
@@ -1626,6 +1583,26 @@ function renderMcpToolResult(
         return Math.round(ageMs / 1000);
     }
 
+    function isCancellationError(error: unknown, signal?: AbortSignal): boolean {
+        if (signal?.aborted) return true;
+        if (typeof error === "object" && error !== null && "name" in error) {
+            if ((error as { name?: string }).name === "AbortError") return true;
+        }
+        const message = error instanceof Error ? error.message : String(error ?? "");
+        return /\b(cancelled|canceled|aborted|abort)\b/i.test(message);
+    }
+
+    function buildToolErrorMessage(message: string, inputSchema?: unknown): string {
+        let output = message.trim().replace(/^Error:\s*/i, "");
+        if (!/^Failed to call tool:/i.test(output)) {
+            output = `Failed to call tool: ${output}`;
+        }
+        if (inputSchema && !output.includes("Expected parameters:")) {
+            output += `\n\nExpected parameters:\n${formatSchema(inputSchema)}`;
+        }
+        return output;
+    }
+
     function getEffectiveIdleTimeoutMinutes(state: McpExtensionState, serverName: string): number {
         const definition = state.config.mcpServers[serverName];
         if (!definition) {
@@ -1660,10 +1637,13 @@ function renderMcpToolResult(
             updateMetadataCache(state, serverName);
             updateStatusBar(state);
             return true;
-        } catch {
-            state.failureTracker.set(serverName, Date.now());
+        } catch (error) {
             state.ui?.setStatus("mcp", "");
             updateStatusBar(state);
+            if (isCancellationError(error, signal)) {
+                throw (error instanceof Error ? error : new Error(`Connection to ${serverName} cancelled`));
+            }
+            state.failureTracker.set(serverName, Date.now());
             return false;
         }
     }

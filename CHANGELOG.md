@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] - 2026-04-17
+
+### Fixed
+- Normalized MCP error signaling to always use `throw` in failure paths (`connect`, `call`, `list`, `describe`, `search`) so Pi marks tool results consistently as errors (red background) instead of successful results (green background).
+- Fixed cancelled connect UX: ESC-cancelled connections now render as cancellation text without forced `Error:` prefix while still keeping error state styling.
+- Fixed duplicated error wrapping and schema hints in tool-call failures (removed repeated `Error:` / `Failed to call tool:` prefixes and duplicate `Expected parameters:` blocks).
+
 ## [0.1.22] - 2026-04-17
 
 ### Changed
