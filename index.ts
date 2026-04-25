@@ -986,9 +986,7 @@ function renderMcpToolResult(
         }
 
         try {
-            if (state.ui) {
-                state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
-            }
+            setMcpStatus(state, `MCP: connecting to ${serverName}...`);
             const connection = await state.manager.connect(serverName, definition, signal);
             const prefix = state.config.settings?.toolPrefix ?? "server";
             const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
@@ -1099,9 +1097,7 @@ function renderMcpToolResult(
             }
 
             try {
-                if (state.ui) {
-                    state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
-                }
+                setMcpStatus(state, `MCP: connecting to ${serverName}...`);
                 connection = await state.manager.connect(serverName, definition);
                 state.failureTracker.delete(serverName);
                 updateServerMetadata(state, serverName);
@@ -1234,7 +1230,7 @@ function renderMcpToolResult(
                 return mode === "keep-alive" || mode === "eager";
             });
 
-        if (ctx.hasUI && startupServers.length > 0) {
+        if (ctx.hasUI && startupServers.length > 0 && config.settings?.showStatus !== false) {
             ctx.ui.setStatus("mcp", `MCP: connecting to ${startupServers.length} servers...`);
         }
 
@@ -1564,8 +1560,10 @@ function renderMcpToolResult(
     }
 
     function updateStatusBar(state: McpExtensionState): void {
+        if (state.config.settings?.showStatus === false) return;
         const ui = state.ui;
         if (!ui) return;
+        
         const total = Object.keys(state.config.mcpServers).length;
         if (total === 0) {
             ui.setStatus("mcp", "");
@@ -1573,6 +1571,14 @@ function renderMcpToolResult(
         }
         const connectedCount = state.manager.getAllConnections().size;
         ui.setStatus("mcp", ui.theme.fg("accent", `MCP: ${connectedCount}/${total} servers`));
+    }
+
+    // Set transient status message (e.g., "connecting..."), respecting showStatus setting
+    function setMcpStatus(state: McpExtensionState, message: string): void {
+        if (state.config.settings?.showStatus === false) return;
+        const ui = state.ui;
+        if (!ui) return;
+        ui.setStatus("mcp", ui.theme.fg("accent", message));
     }
 
     function getFailureAgeSeconds(state: McpExtensionState, serverName: string): number | null {
@@ -1628,9 +1634,7 @@ function renderMcpToolResult(
         if (!definition) return false;
 
         try {
-            if (state.ui) {
-                state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
-            }
+            setMcpStatus(state, `MCP: connecting to ${serverName}...`);
             await state.manager.connect(serverName, definition, signal);
             state.failureTracker.delete(serverName);
             updateServerMetadata(state, serverName);

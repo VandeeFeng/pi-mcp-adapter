@@ -84,6 +84,7 @@ export interface McpSettings {
   idleTimeout?: number; // minutes, default 10, 0 to disable
   directTools?: boolean;
   disabledTools?: string[];
+  showStatus?: boolean; // show MCP status in bottom bar (default: true)
 }
 
 // Root config
