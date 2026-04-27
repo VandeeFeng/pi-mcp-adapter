@@ -438,7 +438,11 @@ function renderMcpToolResult(
                 initPromise = null;
                 updateStatusBar(s);
             }).catch(err => {
-                console.error("MCP initialization failed:", err);
+                if (ctx.hasUI && config.settings?.notify) {
+                    ctx.ui.notify(`MCP initialization failed: ${err}`, "error");
+                } else {
+                    console.error("MCP initialization failed:", err);
+                }
                 initPromise = null;
             });
         });
@@ -1230,7 +1234,7 @@ function renderMcpToolResult(
                 return mode === "keep-alive" || mode === "eager";
             });
 
-        if (ctx.hasUI && startupServers.length > 0 && config.settings?.showStatus !== false) {
+        if (ctx.hasUI && startupServers.length > 0 && config.settings?.showStatus === true) {
             ctx.ui.setStatus("mcp", `MCP: connecting to ${startupServers.length} servers...`);
         }
 
@@ -1251,7 +1255,6 @@ function renderMcpToolResult(
                 if (ctx.hasUI) {
                     ctx.ui.notify(`MCP: Failed to connect to ${name}: ${error}`, "error");
                 }
-                console.error(`MCP: Failed to connect to ${name}: ${error}`);
                 continue;
             }
 
@@ -1318,15 +1321,32 @@ function renderMcpToolResult(
         }
 
         lifecycle.setReconnectCallback((serverName) => {
+            if (state.ui && config.settings?.notify) {
+                state.ui.notify(`MCP: Reconnected to ${serverName}`, "info");
+            } else {
+                console.log(`MCP: Reconnected to ${serverName}`);
+            }
             updateServerMetadata(state, serverName);
             updateMetadataCache(state, serverName);
             state.failureTracker.delete(serverName);
             updateStatusBar(state);
         });
 
+        lifecycle.setReconnectErrorCallback((serverName, error) => {
+            if (state.ui && config.settings?.notify) {
+                state.ui.notify(`MCP: Failed to reconnect to ${serverName}: ${error}`, "error");
+            } else {
+                console.error(`MCP: Failed to reconnect to ${serverName}: ${error}`);
+            }
+        });
+
         lifecycle.setIdleShutdownCallback((serverName) => {
             const idleMinutes = getEffectiveIdleTimeoutMinutes(state, serverName);
-            console.log(`MCP: ${serverName} shut down (idle ${idleMinutes}m)`);
+            if (state.ui && config.settings?.notify) {
+                state.ui.notify(`MCP: ${serverName} shut down (idle ${idleMinutes}m)`, "info");
+            } else {
+                console.log(`MCP: ${serverName} shut down (idle ${idleMinutes}m)`);
+            }
             updateStatusBar(state);
         });
 
@@ -1560,7 +1580,7 @@ function renderMcpToolResult(
     }
 
     function updateStatusBar(state: McpExtensionState): void {
-        if (state.config.settings?.showStatus === false) return;
+        if (state.config.settings?.showStatus !== true) return;
         const ui = state.ui;
         if (!ui) return;
         
@@ -1575,7 +1595,7 @@ function renderMcpToolResult(
 
     // Set transient status message (e.g., "connecting..."), respecting showStatus setting
     function setMcpStatus(state: McpExtensionState, message: string): void {
-        if (state.config.settings?.showStatus === false) return;
+        if (state.config.settings?.showStatus !== true) return;
         const ui = state.ui;
         if (!ui) return;
         ui.setStatus("mcp", ui.theme.fg("accent", message));
