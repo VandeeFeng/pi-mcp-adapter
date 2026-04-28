@@ -121,6 +121,8 @@ Two calls instead of 26 tools cluttering the context.
 | `showStatus` | Show MCP status in bottom bar (default: false) |
 | `notify` | Show notify messages in TUI (default: false) |
 
+**Debug Mode**: Set `MCP_DEBUG=1` environment variable to see lifecycle events (reconnect, idle shutdown, errors) in stderr. Always active regardless of `notify` setting.
+
 Per-server `idleTimeout` overrides the global setting.
 
 ### Direct Tools

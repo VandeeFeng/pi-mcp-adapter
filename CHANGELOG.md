@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.28] - 2026-04-28
+
+### Added
+- `MCP_DEBUG=1` environment variable enables console output for lifecycle events (reconnect, idle shutdown, errors). Always active regardless of `notify` setting.
+
+### Changed
+- Default behavior: lifecycle events now silent unless `notify: true` or `MCP_DEBUG=1` set
+
 ## [0.1.25] - 2026-04-27
 
 ### Added

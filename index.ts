@@ -1323,7 +1323,8 @@ function renderMcpToolResult(
         lifecycle.setReconnectCallback((serverName) => {
             if (state.ui && config.settings?.notify) {
                 state.ui.notify(`MCP: Reconnected to ${serverName}`, "info");
-            } else {
+            }
+            if (process.env.MCP_DEBUG) {
                 console.log(`MCP: Reconnected to ${serverName}`);
             }
             updateServerMetadata(state, serverName);
@@ -1335,16 +1336,19 @@ function renderMcpToolResult(
         lifecycle.setReconnectErrorCallback((serverName, error) => {
             if (state.ui && config.settings?.notify) {
                 state.ui.notify(`MCP: Failed to reconnect to ${serverName}: ${error}`, "error");
-            } else {
+            }
+            if (process.env.MCP_DEBUG) {
                 console.error(`MCP: Failed to reconnect to ${serverName}: ${error}`);
             }
         });
 
         lifecycle.setIdleShutdownCallback((serverName) => {
-            const idleMinutes = getEffectiveIdleTimeoutMinutes(state, serverName);
             if (state.ui && config.settings?.notify) {
+                const idleMinutes = getEffectiveIdleTimeoutMinutes(state, serverName);
                 state.ui.notify(`MCP: ${serverName} shut down (idle ${idleMinutes}m)`, "info");
-            } else {
+            }
+            if (process.env.MCP_DEBUG) {
+                const idleMinutes = getEffectiveIdleTimeoutMinutes(state, serverName);
                 console.log(`MCP: ${serverName} shut down (idle ${idleMinutes}m)`);
             }
             updateStatusBar(state);
