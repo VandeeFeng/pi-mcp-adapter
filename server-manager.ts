@@ -35,6 +35,10 @@ export class McpServerManager {
     }
   }
 
+  isConnecting(name: string): boolean {
+    return this.connectPromises.has(name);
+  }
+
   async connect(name: string, definition: ServerDefinition, signal?: AbortSignal): Promise<ServerConnection> {
     // Dedupe concurrent connection attempts
     if (this.connectPromises.has(name)) {

@@ -1746,6 +1746,7 @@ function renderMcpToolResult(
                 if (definition?.auth === "oauth" && getStoredTokens(serverName) === undefined) {
                     return "needs-auth";
                 }
+                if (state.manager.isConnecting(serverName)) return "connecting";
                 const connection = state.manager.getConnection(serverName);
                 if (connection?.status === "connected") return "connected";
                 if (getFailureAgeSeconds(state, serverName) !== null) return "failed";

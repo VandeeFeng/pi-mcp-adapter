@@ -96,6 +96,7 @@ interface ServerState {
   source: "user" | "project" | "import";
   importKind?: string;
   connectionStatus: ConnectionStatus;
+  inlineNotice?: string;
   tools: ToolState[];
   hasCachedData: boolean;
 }
@@ -191,6 +192,7 @@ class McpPanel {
         source: prov?.kind ?? "user",
         importKind: prov?.importKind,
         connectionStatus: status,
+        inlineNotice: undefined,
         tools,
         hasCachedData: !!serverCache,
       });
@@ -288,6 +290,9 @@ class McpPanel {
     this.resetInactivityTimeout();
     this.importNotice = null;
     this.authNotice = null;
+    for (const server of this.servers) {
+      server.inlineNotice = undefined;
+    }
 
     if (this.confirmingDiscard) {
       this.handleDiscardInput(data);
@@ -417,6 +422,12 @@ class McpPanel {
       if (!item) return;
       const server = this.servers[item.serverIndex];
       if (server.connectionStatus === "connecting") return;
+      if (server.connectionStatus === "connected") {
+        server.inlineNotice = "(already connected)";
+        this.tui.requestRender();
+        return;
+      }
+      server.inlineNotice = undefined;
       server.connectionStatus = "connecting";
       this.callbacks.reconnect(server.name).then(() => {
         server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
@@ -429,6 +440,7 @@ class McpPanel {
         }
         this.tui.requestRender();
       }).catch(() => {
+        server.inlineNotice = undefined;
         server.connectionStatus = "failed";
         this.tui.requestRender();
       });
@@ -701,16 +713,12 @@ class McpPanel {
     const prefix = isCursor ? fg(t.selected, expandIcon) : fg(t.border, server.expanded ? expandIcon : "·");
 
     const nameStr = isCursor ? bold(fg(t.selected, server.name)) : server.name;
+    const connectedMark = server.connectionStatus === "connected"
+      ? ` ${fg(t.direct, "✔")}`
+      : server.connectionStatus === "failed"
+        ? ` ${fg(t.cancel, "✕")}`
+        : "";
     const importLabel = server.source === "import" ? fg(t.description, ` (${server.importKind ?? "import"})`) : "";
-
-    // Show connecting status
-    if (server.connectionStatus === "connecting") {
-      return `${prefix}   ${nameStr}${importLabel}  ${fg(t.needsAuth, "(connecting...)")}`;
-    }
-
-    if (!server.hasCachedData) {
-      return `${prefix}   ${nameStr}${importLabel}  ${fg(t.description, "(not cached)")}`;
-    }
 
     const directCount = server.tools.filter((t) => t.isDirect).length;
     const totalCount = server.tools.length;
@@ -722,7 +730,13 @@ class McpPanel {
     }
 
     let toolInfo = "";
-    if (totalCount > 0) {
+    if (server.inlineNotice) {
+      toolInfo = fg(t.hint, server.inlineNotice);
+    } else if (server.connectionStatus === "connecting") {
+      toolInfo = fg(t.needsAuth, "(connecting...)");
+    } else if (!server.hasCachedData) {
+      toolInfo = fg(t.description, "(not cached)");
+    } else if (totalCount > 0) {
       toolInfo = `${directCount}/${totalCount}`;
       if (directCount > 0) {
         const tokens = server.tools.filter((t) => t.isDirect).reduce((s, t) => s + t.estimatedTokens, 0);
@@ -731,7 +745,7 @@ class McpPanel {
       toolInfo = fg(t.description, toolInfo);
     }
 
-    return `${prefix} ${toggleIcon} ${nameStr}${importLabel}  ${toolInfo}`;
+    return `${prefix} ${toggleIcon} ${nameStr}${connectedMark}${importLabel}  ${toolInfo}`;
   }
 
   private renderToolRow(tool: ToolState, isCursor: boolean, innerW: number): string {

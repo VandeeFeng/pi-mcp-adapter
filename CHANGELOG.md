@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.29] - 2026-04-30
+
+### Changed
+- Improved `/mcp` server status UX: servers now show `connecting`, `connected`, and `failed` states more clearly with inline indicators.
+- Prevented redundant reconnect attempts for already connected servers and show an inline `(already connected)` notice instead.
+- Synchronized UI status checks with the server manager's in-flight connection state.
+
 ## [0.1.28] - 2026-04-28
 
 ### Added
