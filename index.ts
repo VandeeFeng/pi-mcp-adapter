@@ -2,7 +2,7 @@
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, Theme, ToolInfo } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { existsSync } from "node:fs";
 import { loadMcpConfig, getServerProvenance, writeMcpToolsConfig } from "./config.js";
 import { formatToolName, getServerPrefix, type McpConfig, type McpContent, type ToolMetadata, type McpTool, type McpResource, type ServerEntry, type DirectToolSpec, type McpPanelCallbacks, type McpPanelResult } from "./types.js";
