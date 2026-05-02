@@ -126,6 +126,7 @@ export interface McpPanelCallbacks {
   cancelConnect: (serverName: string) => void;
   getConnectionStatus: (serverName: string) => "connected" | "idle" | "failed" | "needs-auth" | "connecting";
   refreshCacheAfterReconnect: (serverName: string) => import("./metadata-cache.js").ServerCacheEntry | null;
+  getFailureRetryAfterSeconds: (serverName: string) => number | null;
 }
 
 export interface McpPanelResult {

@@ -117,7 +117,7 @@ function renderMcpToolResult(
         return new Text(output.join("\n"), 0, 0);
     }
 
-    const FAILURE_BACKOFF_MS = 60 * 1000;
+    const FAILURE_BACKOFF_MS = 30 * 1000;
 
     /**
      * Find a tool by name with hyphen/underscore normalization fallback.
@@ -1613,6 +1613,14 @@ function renderMcpToolResult(
         return Math.round(ageMs / 1000);
     }
 
+    function getFailureRetryAfterSeconds(state: McpExtensionState, serverName: string): number | null {
+        const failedAt = state.failureTracker.get(serverName);
+        if (!failedAt) return null;
+        const remainingMs = FAILURE_BACKOFF_MS - (Date.now() - failedAt);
+        if (remainingMs <= 0) return null;
+        return Math.ceil(remainingMs / 1000);
+    }
+
     function isCancellationError(error: unknown, signal?: AbortSignal): boolean {
         if (signal?.aborted) return true;
         if (typeof error === "object" && error !== null && "name" in error) {
@@ -1755,6 +1763,9 @@ function renderMcpToolResult(
             refreshCacheAfterReconnect: (serverName: string) => {
                 const freshCache = loadMetadataCache();
                 return freshCache?.servers?.[serverName] ?? null;
+            },
+            getFailureRetryAfterSeconds: (serverName: string) => {
+                return getFailureRetryAfterSeconds(state, serverName);
             },
         };
 

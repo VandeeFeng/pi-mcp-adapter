@@ -427,10 +427,20 @@ class McpPanel {
         this.tui.requestRender();
         return;
       }
+      const retryAfterSeconds = this.callbacks.getFailureRetryAfterSeconds(server.name);
+      if (server.connectionStatus === "failed" && retryAfterSeconds !== null) {
+        server.inlineNotice = `(retry after ${retryAfterSeconds}s)`;
+        this.tui.requestRender();
+        return;
+      }
       server.inlineNotice = undefined;
       server.connectionStatus = "connecting";
-      this.callbacks.reconnect(server.name).then(() => {
+      this.callbacks.reconnect(server.name).then((connected) => {
         server.connectionStatus = this.callbacks.getConnectionStatus(server.name);
+        if (!connected && server.connectionStatus === "failed") {
+          const retryAfter = this.callbacks.getFailureRetryAfterSeconds(server.name);
+          server.inlineNotice = retryAfter !== null ? `(retry after ${retryAfter}s)` : undefined;
+        }
         if (server.connectionStatus === "connected") {
           const entry = this.callbacks.refreshCacheAfterReconnect(server.name);
           if (entry) {
